@@ -1,0 +1,28 @@
+{
+  "cookie": "SESSDATA=xxxxxxxx; bili_jct=xxxxxxxx; DedeUserID=12345678",
+  "project_id": 102626,
+  "screen_id": 0,
+  "sku_id": 0,
+  "buyer_ids": [],
+  "count": 1,
+  "start_time": "2026-06-08T20:00:00",
+  "interval_ms": 800,
+  "max_attempts": 300,
+  "prewarm_seconds": 30,
+  "rate_limit_backoff_ms": 2000,
+  "network_backoff_max_ms": 3000,
+  "return_monitor_enabled": false,
+  "monitor_interval_ms": 5000,
+  "monitor_end_time": "",
+  "captcha_mode": "manual",
+  "rrocr_token": "",
+  "notify": {
+    "bark_url": "",
+    "serverchan_key": "",
+    "imessage_recipient": ""
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8000
+  }
+}

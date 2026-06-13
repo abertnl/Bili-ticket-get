@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>B 站会员购抢票工具</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">票</span>
+      <div>
+        <h1>会员购抢票工具</h1>
+        <p class="sub">本地运行 · 仅供个人买票自用</p>
+      </div>
+    </div>
+    <div class="user-chip" id="userChip">未登录</div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="login">1. 登录</button>
+    <button class="tab" data-tab="config">2. 配置</button>
+    <button class="tab" data-tab="monitor">3. 抢票监控</button>
+  </nav>
+
+  <main>
+    <!-- 登录 -->
+    <section class="panel active" id="tab-login">
+      <div class="card">
+        <h2>扫码登录</h2>
+        <p class="hint">用 B 站手机客户端扫码（推荐）。</p>
+        <div class="qr-box">
+          <img id="qrImg" alt="点击下方按钮生成二维码" />
+          <div class="qr-status" id="qrStatus"></div>
+        </div>
+        <button class="btn" id="genQrBtn">生成二维码</button>
+      </div>
+
+      <div class="card">
+        <h2>Cookie 登录</h2>
+        <p class="hint">从浏览器复制 show.bilibili.com 的 Cookie（含 SESSDATA、bili_jct、DedeUserID）。</p>
+        <textarea id="cookieInput" rows="4" placeholder="SESSDATA=xxx; bili_jct=xxx; DedeUserID=xxx"></textarea>
+        <button class="btn" id="cookieBtn">使用 Cookie 登录</button>
+      </div>
+    </section>
+
+    <!-- 配置 -->
+    <section class="panel" id="tab-config">
+      <div class="card">
+        <h2>演出与票档</h2>
+        <div class="row">
+          <label>演出链接或 project_id</label>
+          <div class="inline">
+            <input id="projectInput" placeholder="粘贴会员购链接 或 直接填 project_id" />
+            <button class="btn ghost" id="loadProjectBtn">加载</button>
+          </div>
+        </div>
+        <div id="projectInfo" class="project-info"></div>
+        <div class="row">
+          <label>场次</label>
+          <select id="screenSelect"></select>
+        </div>
+        <div class="row">
+          <label>票档</label>
+          <select id="skuSelect"></select>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>购票人</h2>
+        <button class="btn ghost" id="loadBuyersBtn">加载购票人</button>
+        <div id="buyerList" class="buyer-list"></div>
+      </div>
+
+      <div class="card">
+        <h2>抢票参数</h2>
+        <div class="grid2">
+          <div class="row"><label>数量</label><input type="number" id="countInput" min="1" value="1" /></div>
+          <div class="row">
+            <label>开抢时间</label>
+            <div class="time-pair">
+              <input type="date" id="startDateInput" />
+              <input type="time" id="startTimeInput" step="1" />
+            </div>
+            <p class="field-hint">精确到秒；留空表示点击开始后立即开抢。</p>
+          </div>
+          <div class="row"><label>请求间隔(ms)</label><input type="number" id="intervalInput" min="100" value="800" /></div>
+          <div class="row"><label>最大尝试次数</label><input type="number" id="maxAttemptsInput" min="1" value="300" /></div>
+          <div class="row">
+            <label>预热提前量(s)</label>
+            <input type="number" id="prewarmSecondsInput" min="0" value="30" />
+            <p class="field-hint">到点前预先刷新凭据、加载购票人和票价。</p>
+          </div>
+          <div class="row">
+            <label>限流退避(ms)</label>
+            <input type="number" id="rateLimitBackoffInput" min="1000" value="2000" />
+          </div>
+          <div class="row">
+            <label>网络退避上限(ms)</label>
+            <input type="number" id="networkBackoffMaxInput" min="100" value="3000" />
+          </div>
+          <div class="row">
+            <label class="check-row">
+              <input type="checkbox" id="returnMonitorEnabled" />
+              启用回流票监控
+            </label>
+            <p class="field-hint">售罄期间低频监控票档，发现疑似可售后自动进入下单冲刺。</p>
+          </div>
+          <div class="row"><label>监控间隔(ms)</label><input type="number" id="monitorIntervalInput" min="1000" value="5000" /></div>
+          <div class="row">
+            <label>监控截止时间</label>
+            <div class="time-pair">
+              <input type="date" id="monitorEndDateInput" />
+              <input type="time" id="monitorEndTimeInput" step="1" />
+            </div>
+          </div>
+          <div class="row"><label>验证码方式</label>
+            <select id="captchaMode">
+              <option value="manual">人工(半自动)</option>
+              <option value="rrocr">第三方打码(rrocr)</option>
+            </select>
+          </div>
+          <div class="row"><label>rrocr token</label><input id="rrocrToken" placeholder="captcha_mode=rrocr 时填" /></div>
+        </div>
+        <h3>推送（可选）</h3>
+        <div class="grid2">
+          <div class="row"><label>Bark URL</label><input id="barkUrl" placeholder="https://api.day.app/yourkey" /></div>
+          <div class="row"><label>Server酱 Key</label><input id="serverchanKey" placeholder="SCTxxxxx" /></div>
+          <div class="row"><label>iMessage 收件人</label><input id="imessageRecipient" placeholder="手机号或 Apple ID（Mac mini）" /></div>
+        </div>
+        <button class="btn" id="saveConfigBtn">保存配置</button>
+        <span id="saveHint" class="save-hint"></span>
+      </div>
+    </section>
+
+    <!-- 监控 -->
+    <section class="panel" id="tab-monitor">
+      <div class="card">
+        <div class="monitor-head">
+          <div class="stats">
+            <div class="stat"><span class="num" id="statAttempts">0</span><span class="lbl">尝试次数</span></div>
+            <div class="stat"><span class="num" id="statMonitorChecks">0</span><span class="lbl">监控次数</span></div>
+            <div class="stat"><span class="num" id="statCode">-</span><span class="lbl">最近返回码</span></div>
+            <div class="stat"><span class="num" id="statState">空闲</span><span class="lbl">状态</span></div>
+            <div class="stat"><span class="num" id="statLastAttemptMs">0ms</span><span class="lbl">最近耗时</span></div>
+            <div class="stat"><span class="num" id="statAvgAttemptMs">0ms</span><span class="lbl">平均耗时</span></div>
+            <div class="stat"><span class="num" id="statNetworkErrors">0</span><span class="lbl">网络异常</span></div>
+          </div>
+          <div class="controls">
+            <button class="btn" id="startBtn">保存并开始抢票</button>
+            <button class="btn danger" id="stopBtn">停止</button>
+          </div>
+        </div>
+        <div class="retry-info" id="retryInfo"></div>
+        <div id="lastMsg" class="last-msg"></div>
+      </div>
+
+      <div class="card">
+        <h2>实时日志</h2>
+        <div id="log" class="log"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 验证码弹窗（人工模式） -->
+  <div class="modal" id="captchaModal">
+    <div class="modal-box">
+      <h2>需要人机验证</h2>
+      <p class="hint">触发风控。请在 B 站完成极验后，把验证结果回填（gt/challenge 已带出，可配合第三方工具）。</p>
+      <div class="row"><label>gt</label><input id="capGt" readonly /></div>
+      <div class="row"><label>challenge</label><input id="capChallenge" readonly /></div>
+      <div class="row"><label>validate</label><input id="capValidate" placeholder="极验返回的 validate" /></div>
+      <div class="row"><label>seccode</label><input id="capSeccode" placeholder="极验返回的 seccode" /></div>
+      <button class="btn" id="capSubmit">提交验证结果</button>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+[project]
+name = "ticket-buy"
+version = "0.1.0"
+description = "B 站会员购抢票工具（本地 Web 版），仅供个人买票自用"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "httpx>=0.28.0",
+    "qrcode>=8.0",
+    "pillow>=11.0.0",
+    "pydantic>=2.10.0",
+]
+
+[project.scripts]
+ticket-buy = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
