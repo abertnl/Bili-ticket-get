@@ -26,7 +26,7 @@ Bilibili 会员购（show.bilibili.com）本地抢票工具。基于 FastAPI 的
 
 ```bash
 # 克隆项目
-git clone <repo-url>
+git clone https://github.com/abertnl/Bili-ticket-get.git
 cd Bili-ticket-get
 
 # 安装依赖
@@ -36,7 +36,7 @@ uv sync
 uv run main.py
 ```
 
-浏览器打开 `http://127.0.0.1:8000` 即可使用。
+启动后终端会打印本次临时管理 token。浏览器打开 `http://127.0.0.1:8000` 后输入 token 即可使用。
 
 ### 使用步骤
 
@@ -64,8 +64,10 @@ uv run main.py
 | `rate_limit_backoff_ms` | 限流退避（毫秒） | `2000` |
 | `captcha_mode` | 验证码方式：`manual` / `rrocr` | `manual` |
 | `return_monitor_enabled` | 启用回流票监控 | `false` |
-| `notify.bark_url` | Bark 推送地址 | `""` |
+| `notify.bark_url` | Bark 推送地址，仅允许 `https://api.day.app/...` | `""` |
 | `notify.serverchan_key` | Server 酱 Key | `""` |
+| `server.admin_token` | 管理 token；留空则启动时生成临时 token，也可用 `TICKET_BUY_ADMIN_TOKEN` 覆盖 | `""` |
+| `server.allowed_origins` | 反代/隧道访问时允许的 Origin 列表，如 `https://example.com` | `[]` |
 
 ## 项目结构
 
@@ -87,6 +89,8 @@ uv run main.py
 │   ├── app.js
 │   └── style.css
 ├── config.example.json     # 配置示例
+├── LICENSE                 # 开源许可证
+├── SECURITY.md             # 安全说明
 ├── pyproject.toml          # 项目元数据与依赖
 └── docs/
     └── 使用说明.md         # 详细使用文档

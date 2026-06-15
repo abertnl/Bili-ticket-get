@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable
 from urllib.parse import quote
 
 import httpx
 
 from .config import NotifyConfig
+
+
+def _redact_error_message(message: str, secrets: list[str]) -> str:
+    redacted = message
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "***")
+    redacted = re.sub(r"https://api\.day\.app/[^\s]+", "https://api.day.app/***", redacted)
+    redacted = re.sub(r"https://sctapi\.ftqq\.com/[^\s]+\.send", "https://sctapi.ftqq.com/***.send", redacted)
+    return redacted
 
 
 async def _send_bark(base_url: str, title: str, body: str) -> None:
@@ -59,11 +70,13 @@ end run
 async def send_all(config: NotifyConfig, title: str, body: str) -> None:
     """根据配置把消息推送到所有已配置渠道。"""
 
+    secrets = [config.bark_url, config.serverchan_key]
+
     async def capture(name: str, action: Awaitable[None]) -> str | None:
         try:
             await action
         except Exception as exc:  # noqa: BLE001
-            return f"{name}: {exc}"
+            return f"{name}: {_redact_error_message(str(exc), secrets)}"
         return None
 
     tasks: list[Awaitable[str | None]] = []

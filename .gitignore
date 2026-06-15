@@ -5,9 +5,17 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
 
 # Virtual environments
 .venv
 
 # 本地配置（包含登录 Cookie，请勿提交）
 config.json
+
+# Local/editor metadata
+*:Zone.Identifier
+.claude/
+CLAUDE.md
+.DS_Store
+Thumbs.db

@@ -1,11 +1,11 @@
 {
-  "cookie": "SESSDATA=xxxxxxxx; bili_jct=xxxxxxxx; DedeUserID=12345678",
-  "project_id": 102626,
+  "cookie": "",
+  "project_id": 0,
   "screen_id": 0,
   "sku_id": 0,
   "buyer_ids": [],
   "count": 1,
-  "start_time": "2026-06-08T20:00:00",
+  "start_time": "",
   "interval_ms": 800,
   "max_attempts": 300,
   "prewarm_seconds": 30,
@@ -23,6 +23,8 @@
   },
   "server": {
     "host": "127.0.0.1",
-    "port": 8000
+    "port": 8000,
+    "admin_token": "",
+    "allowed_origins": []
   }
 }

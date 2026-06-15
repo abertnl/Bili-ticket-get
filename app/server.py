@@ -4,22 +4,30 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
+import time
 from concurrent.futures import Future
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import parse_qs, urlparse
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from .bili import auth, ticket
 from .bili.client import BiliClient
-from .config import AppConfig, NotifyConfig, load_config, save_config
+from .config import AppConfig, NotifyConfig, effective_admin_token, ensure_admin_token, load_config, save_config
 from .grabber import Grabber
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+ADMIN_COOKIE_NAME = "ticket_buy_admin"
+AUTH_BODY_MAX_BYTES = 1024
+AUTH_FAILURE_LIMIT = 5
+AUTH_FAILURE_WINDOW_SECONDS = 60.0
+_auth_failures: dict[str, list[float]] = {}
 
 
 class AppState:
@@ -27,6 +35,7 @@ class AppState:
 
     def __init__(self) -> None:
         self.config: AppConfig = load_config()
+        ensure_admin_token(self.config)
         self.grabber: Grabber | None = None
         self.clients: set[WebSocket] = set()
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -60,12 +69,12 @@ state = AppState()
 
 # ---- 请求体模型 ----
 class CookieLogin(BaseModel):
-    cookie: str
+    cookie: str = Field(max_length=16384)
 
 
 class CaptchaSubmit(BaseModel):
-    validate_value: str = Field(alias="validate")
-    seccode: str
+    validate_value: str = Field(alias="validate", max_length=2048)
+    seccode: str = Field(max_length=2048)
 
 
 class ConfigUpdate(BaseModel):
@@ -76,7 +85,7 @@ class ConfigUpdate(BaseModel):
     sku_id: int | None = Field(default=None, ge=0)
     buyer_ids: list[int] | None = None
     count: int | None = Field(default=None, ge=1)
-    start_time: str | None = None
+    start_time: str | None = Field(default=None, max_length=64)
     interval_ms: int | None = Field(default=None, ge=100)
     max_attempts: int | None = Field(default=None, ge=1)
     prewarm_seconds: int | None = Field(default=None, ge=0)
@@ -84,9 +93,9 @@ class ConfigUpdate(BaseModel):
     network_backoff_max_ms: int | None = Field(default=None, ge=100)
     return_monitor_enabled: bool | None = None
     monitor_interval_ms: int | None = Field(default=None, ge=1000)
-    monitor_end_time: str | None = None
+    monitor_end_time: str | None = Field(default=None, max_length=64)
     captcha_mode: Literal["manual", "rrocr"] | None = None
-    rrocr_token: str | None = None
+    rrocr_token: str | None = Field(default=None, max_length=512)
     notify: NotifyConfig | None = None
 
     @field_validator("buyer_ids")
@@ -101,8 +110,10 @@ def _public_config(config: AppConfig) -> dict[str, Any]:
     """返回给浏览器的配置，避免回显账号凭据和推送密钥。"""
 
     data = config.model_dump(exclude={"cookie", "rrocr_token"})
+    data["server"].pop("admin_token", None)
     data["has_cookie"] = bool(config.cookie)
     data["has_rrocr_token"] = bool(config.rrocr_token)
+    data["admin_token_required"] = _admin_token_required()
     data["notify"] = {"bark_url": "", "serverchan_key": "", "imessage_recipient": ""}
     data["notify_configured"] = {
         "bark_url": bool(config.notify.bark_url),
@@ -114,6 +125,122 @@ def _public_config(config: AppConfig) -> dict[str, Any]:
 
 def _error(message: str, status_code: int = 400) -> JSONResponse:
     return JSONResponse({"ok": False, "message": message}, status_code=status_code)
+
+
+def _admin_token_required() -> bool:
+    return True
+
+
+def _admin_token() -> str:
+    return effective_admin_token(state.config)
+
+
+def _token_matches(value: str | None) -> bool:
+    token = _admin_token()
+    if not token or value is None:
+        return False
+    return hmac.compare_digest(value, token)
+
+
+def _bearer_token(header: str | None) -> str | None:
+    if not header:
+        return None
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() == "bearer" and value:
+        return value
+    return None
+
+
+def _request_authorized(request: Request) -> bool:
+    if not _admin_token_required():
+        return True
+    return (
+        _token_matches(request.cookies.get(ADMIN_COOKIE_NAME))
+        or _token_matches(request.headers.get("x-admin-token"))
+        or _token_matches(_bearer_token(request.headers.get("authorization")))
+    )
+
+
+def _websocket_authorized(websocket: WebSocket) -> bool:
+    if not _admin_token_required():
+        return True
+    return (
+        _origin_allowed(websocket.headers.get("origin"), websocket.headers.get("host"))
+        and (
+            _token_matches(websocket.cookies.get(ADMIN_COOKIE_NAME))
+            or _token_matches(websocket.headers.get("x-admin-token"))
+            or _token_matches(_bearer_token(websocket.headers.get("authorization")))
+        )
+    )
+
+
+def _origin_allowed(origin: str | None, host_header: str | None) -> bool:
+    if not origin:
+        return True
+    if not host_header:
+        return False
+    parsed = urlparse(origin)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    normalized = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    if normalized in state.config.server.allowed_origins:
+        return True
+    return parsed.netloc.lower() == host_header.split(",", 1)[0].strip().lower()
+
+
+def _auth_client_key(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _auth_failures_for(client_key: str) -> list[float]:
+    now = time.monotonic()
+    failures = [ts for ts in _auth_failures.get(client_key, []) if now - ts <= AUTH_FAILURE_WINDOW_SECONDS]
+    _auth_failures[client_key] = failures
+    return failures
+
+
+def _auth_rate_limited(client_key: str) -> bool:
+    return len(_auth_failures_for(client_key)) >= AUTH_FAILURE_LIMIT
+
+
+def _record_auth_failure(client_key: str) -> None:
+    failures = _auth_failures_for(client_key)
+    failures.append(time.monotonic())
+    _auth_failures[client_key] = failures
+
+
+def _clear_auth_failures(client_key: str) -> None:
+    _auth_failures.pop(client_key, None)
+
+
+def _set_admin_cookie(response: Response, request: Request, token: str) -> None:
+    response.set_cookie(
+        ADMIN_COOKIE_NAME,
+        token,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict",
+        max_age=60 * 60 * 12,
+    )
+
+
+def _login_page() -> Response:
+    return Response(
+        """<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理验证</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:420px;margin:12vh auto;padding:0 20px;line-height:1.5">
+  <h1>管理验证</h1>
+  <form method="post" action="/auth/token">
+    <label for="token">管理 token</label>
+    <input id="token" name="token" type="password" autocomplete="current-password" required autofocus
+      style="display:block;width:100%;box-sizing:border-box;margin:8px 0 16px;padding:10px">
+    <button type="submit" style="padding:10px 14px">进入</button>
+  </form>
+</body>
+</html>""",
+        media_type="text/html; charset=utf-8",
+    )
 
 
 def _merge_sensitive_updates(updates: dict[str, Any]) -> dict[str, Any]:
@@ -181,10 +308,50 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="B 站会员购抢票工具", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def require_admin_token(request: Request, call_next):
+    if request.url.path.startswith("/api/"):
+        if not _origin_allowed(request.headers.get("origin"), request.headers.get("host")):
+            return _error("未授权：来源不被允许", 403)
+        if not _request_authorized(request):
+            return _error("未授权：请提供管理 token", 401)
+    return await call_next(request)
+
+
 # ---- 页面 ----
 @app.get("/")
-async def index() -> FileResponse:
+async def index(request: Request) -> Response:
+    if not _request_authorized(request):
+        return _login_page()
     return FileResponse(WEB_DIR / "index.html")
+
+
+@app.post("/auth/token")
+async def auth_token(request: Request) -> Response:
+    if not _origin_allowed(request.headers.get("origin"), request.headers.get("host")):
+        return _error("未授权：来源不被允许", 403)
+    client_key = _auth_client_key(request)
+    if _auth_rate_limited(client_key):
+        return _error("认证失败次数过多，请稍后再试", 429)
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            parsed_length = int(content_length)
+        except ValueError:
+            return _error("Content-Length 无效", 400)
+        if parsed_length > AUTH_BODY_MAX_BYTES:
+            return _error("请求体过大", 413)
+    body = (await request.body()).decode("utf-8", errors="replace")
+    if len(body.encode("utf-8")) > AUTH_BODY_MAX_BYTES:
+        return _error("请求体过大", 413)
+    token = parse_qs(body).get("token", [""])[0]
+    if not _token_matches(token):
+        _record_auth_failure(client_key)
+        return _error("管理 token 无效", 401)
+    _clear_auth_failures(client_key)
+    response = RedirectResponse("/", status_code=303)
+    _set_admin_cookie(response, request, token)
+    return response
 
 
 # ---- 登录 ----
@@ -198,7 +365,7 @@ async def login_qr() -> Any:
 
 
 @app.get("/api/login/poll")
-async def login_poll(qrcode_key: str) -> Any:
+async def login_poll(qrcode_key: str = Query(max_length=256)) -> Any:
     try:
         result = await auth.poll_qr(qrcode_key)
     except Exception as exc:  # noqa: BLE001
@@ -363,6 +530,9 @@ async def captcha_submit(body: CaptchaSubmit) -> dict[str, Any]:
 # ---- WebSocket 实时日志 ----
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket) -> None:
+    if not _websocket_authorized(websocket):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     state.clients.add(websocket)
     try:

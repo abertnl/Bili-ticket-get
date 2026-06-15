@@ -84,7 +84,7 @@ class RrocrSolver:
     需要用户自备 token。仅作为可插拔示例，使用第三方服务请自行评估合规与风险。
     """
 
-    API = "http://api.rrocr.com/api/recognize.html"
+    API = "https://api.rrocr.com/api/recognize.html"
 
     def __init__(self, token: str, referer: str = "https://show.bilibili.com/") -> None:
         self.token = token
