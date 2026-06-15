@@ -175,11 +175,18 @@ class Grabber:
 
     async def _resolve_buyers(self) -> list[ticket.Buyer]:
         assert self._client is not None
+        wanted_ids = list(dict.fromkeys(self.config.buyer_ids))
+        if len(wanted_ids) != len(self.config.buyer_ids):
+            raise RuntimeError("购票人不能重复选择")
         all_buyers = await ticket.get_buyers(self._client)
-        wanted = set(self.config.buyer_ids)
+        wanted = set(wanted_ids)
         chosen = [b for b in all_buyers if b.buyer_id in wanted]
-        if not chosen:
-            raise RuntimeError("未匹配到购票人，请检查 buyer_ids 配置")
+        if len(chosen) != len(wanted):
+            found = {b.buyer_id for b in chosen}
+            missing = [str(buyer_id) for buyer_id in wanted_ids if buyer_id not in found]
+            raise RuntimeError(f"未匹配到购票人: {', '.join(missing)}，请重新加载购票人")
+        if len(chosen) != self.config.count:
+            raise RuntimeError("购票人数必须与购买数量一致")
         return chosen
 
     async def _resolve_price(self) -> int:
@@ -188,11 +195,7 @@ class Grabber:
             project = await ticket.get_project(self._client, self.config.project_id)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"获取演出信息失败: {exc}") from exc
-        for screen in project.screens:
-            for sku in screen.skus:
-                if sku.sku_id == self.config.sku_id:
-                    return sku.price
-        raise RuntimeError("未匹配到指定票档，请重新加载演出并选择票档")
+        return self._find_target_sku(project).price
 
     def _parse_local_time(self, value: str, label: str) -> datetime | None:
         if not value:
@@ -461,7 +464,7 @@ class Grabber:
         )
         self._emit_status()
 
-        if kind is ResultKind.SUCCESS or _has_pending_order(result.message):
+        if kind is ResultKind.SUCCESS or _has_pending_order(result.message, result.code):
             self.status.success = True
             self.status.order_id = result.order_id
             self.status.finished_reason = "订单已生成"
@@ -510,6 +513,16 @@ class Grabber:
         self._emit_status()
 
         kind = classify(code)
+        if _has_pending_order(message, code):
+            self.status.success = True
+            self.status.finished_reason = "订单已生成"
+            self._emit(
+                f"{message} 请尽快前往 B 站完成支付",
+                "success",
+            )
+            await self._notify_payment_required("", message)
+            return self._outcome_result(AttemptOutcome.STOP)
+
         if kind is ResultKind.FATAL:
             self.status.finished_reason = message
             self._emit(f"致命错误，停止抢票: {message}", "error")
@@ -569,7 +582,7 @@ class Grabber:
             self._emit(f"推送失败: {exc}", "warn")
 
 
-def _has_pending_order(message: str) -> bool:
+def _has_pending_order(message: str, code: int | None = None) -> bool:
     """会员购在已锁单/待支付时可能只返回提示文案，而不是标准成功码。"""
 
-    return "尚未完成订单" in message or "待支付" in message
+    return code == 100048 or "尚未完成订单" in message or "待支付" in message

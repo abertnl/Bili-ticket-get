@@ -5,17 +5,20 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app import notify
 from app import server
+from app.bili.captcha import RrocrSolver
 from app.bili import ticket
 from app.bili.errors import ResultKind, classify
-from app.config import AppConfig, NotifyConfig
+from app.config import AppConfig, NotifyConfig, ServerConfig
 from app.grabber import AttemptOutcome, Grabber, _has_pending_order
 
 
 class ServerConfigTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.admin_token = "0123456789abcdef"
         server.state.config = AppConfig(
             cookie="SESSDATA=secret; bili_jct=csrf; DedeUserID=1",
             rrocr_token="rrocr-secret",
@@ -24,9 +27,11 @@ class ServerConfigTests(unittest.TestCase):
                 serverchan_key="SCT-secret",
                 imessage_recipient="+15555550123",
             ),
+            server=ServerConfig(admin_token=self.admin_token),
         )
         server.state.grabber = None
-        self.client = TestClient(server.app)
+        server._auth_failures.clear()
+        self.client = TestClient(server.app, headers={"X-Admin-Token": self.admin_token})
 
     def test_config_response_redacts_sensitive_values(self) -> None:
         response = self.client.get("/api/config")
@@ -45,6 +50,113 @@ class ServerConfigTests(unittest.TestCase):
             data["notify_configured"],
             {"bark_url": True, "serverchan_key": True, "imessage_recipient": True},
         )
+
+    def test_api_requires_admin_token(self) -> None:
+        server.state.config = AppConfig(
+            server=ServerConfig(admin_token=self.admin_token),
+        )
+        plain_client = TestClient(server.app)
+
+        response = plain_client.get("/api/config")
+        authorized = plain_client.get(
+            "/api/config",
+            headers={"X-Admin-Token": self.admin_token},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["ok"], False)
+        self.assertEqual(authorized.status_code, 200)
+        self.assertNotIn("admin_token", authorized.json()["server"])
+
+    def test_token_form_sets_admin_cookie(self) -> None:
+        server.state.config = AppConfig(
+            server=ServerConfig(admin_token=self.admin_token),
+        )
+        plain_client = TestClient(server.app)
+
+        login_page = plain_client.get("/")
+        bad = plain_client.post("/auth/token", data={"token": "wrong"})
+        good = plain_client.post("/auth/token", data={"token": self.admin_token})
+        response = plain_client.get("/api/config")
+
+        self.assertEqual(login_page.status_code, 200)
+        self.assertIn("管理验证", login_page.text)
+        self.assertEqual(bad.status_code, 401)
+        self.assertEqual(good.status_code, 200)
+        self.assertEqual(response.status_code, 200)
+
+    def test_websocket_requires_admin_token(self) -> None:
+        server.state.config = AppConfig(
+            server=ServerConfig(admin_token=self.admin_token),
+        )
+        plain_client = TestClient(server.app)
+
+        with self.assertRaises(WebSocketDisconnect) as cm:
+            with plain_client.websocket_connect("/ws"):
+                pass
+
+        self.assertEqual(cm.exception.code, 1008)
+
+        with plain_client.websocket_connect("/ws", headers={"X-Admin-Token": self.admin_token}):
+            pass
+
+    def test_cross_origin_api_and_websocket_are_rejected(self) -> None:
+        server.state.config = AppConfig(
+            server=ServerConfig(admin_token=self.admin_token),
+        )
+        plain_client = TestClient(server.app)
+
+        response = plain_client.get(
+            "/api/config",
+            headers={"X-Admin-Token": self.admin_token, "Origin": "https://evil.example"},
+        )
+        self.assertEqual(response.status_code, 403)
+
+        with self.assertRaises(WebSocketDisconnect) as cm:
+            with plain_client.websocket_connect(
+                "/ws",
+                headers={"X-Admin-Token": self.admin_token, "Origin": "https://evil.example"},
+            ):
+                pass
+
+        self.assertEqual(cm.exception.code, 1008)
+
+    def test_configured_allowed_origin_can_access_api_and_websocket(self) -> None:
+        server.state.config = AppConfig(
+            server=ServerConfig(
+                admin_token=self.admin_token,
+                allowed_origins=["https://proxy.example"],
+            ),
+        )
+        plain_client = TestClient(server.app)
+
+        response = plain_client.get(
+            "/api/config",
+            headers={"X-Admin-Token": self.admin_token, "Origin": "https://proxy.example"},
+        )
+        self.assertEqual(response.status_code, 200)
+
+        with plain_client.websocket_connect(
+            "/ws",
+            headers={"X-Admin-Token": self.admin_token, "Origin": "https://proxy.example"},
+        ):
+            pass
+
+    def test_token_auth_limits_failures_and_body_size(self) -> None:
+        server.state.config = AppConfig(
+            server=ServerConfig(admin_token=self.admin_token),
+        )
+        plain_client = TestClient(server.app)
+
+        too_large = plain_client.post("/auth/token", content="token=" + ("x" * 2048))
+        self.assertEqual(too_large.status_code, 413)
+
+        for _ in range(server.AUTH_FAILURE_LIMIT):
+            response = plain_client.post("/auth/token", data={"token": "wrong"})
+            self.assertEqual(response.status_code, 401)
+
+        limited = plain_client.post("/auth/token", data={"token": "wrong"})
+        self.assertEqual(limited.status_code, 429)
 
     def test_empty_sensitive_update_preserves_existing_values(self) -> None:
         with patch("app.server.save_config"):
@@ -75,12 +187,19 @@ class ServerConfigTests(unittest.TestCase):
             {"monitor_interval_ms": 999},
             {"captcha_mode": "bad"},
             {"buyer_ids": [1, 0]},
+            {"notify": {"bark_url": "http://api.day.app/bark-secret"}},
+            {"notify": {"bark_url": "https://127.0.0.1/bark-secret"}},
+            {"notify": {"serverchan_key": "../SCT-secret"}},
         ]
 
         for payload in cases:
             with self.subTest(payload=payload):
                 response = self.client.post("/api/config", json=payload)
                 self.assertEqual(response.status_code, 422)
+
+    def test_allowed_origin_rejects_paths(self) -> None:
+        with self.assertRaises(ValueError):
+            ServerConfig(allowed_origins=["https://proxy.example/path"])
 
     def test_project_id_must_be_positive(self) -> None:
         response = self.client.get("/api/project?project_id=0")
@@ -112,6 +231,7 @@ class ServerConfigTests(unittest.TestCase):
             buyer_ids=[1],
             return_monitor_enabled=True,
             monitor_end_time="bad-date",
+            server=ServerConfig(admin_token=self.admin_token),
         )
 
         response = self.client.post("/api/grab/start")
@@ -123,6 +243,9 @@ class ServerConfigTests(unittest.TestCase):
 
 
 class NotifyTests(unittest.IsolatedAsyncioTestCase):
+    def test_rrocr_solver_uses_https_endpoint(self) -> None:
+        self.assertTrue(RrocrSolver.API.startswith("https://"))
+
     async def test_send_all_includes_imessage_channel(self) -> None:
         config = NotifyConfig(imessage_recipient="+15555550123")
 
@@ -142,13 +265,23 @@ class NotifyTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch("app.notify._send_bark", new=AsyncMock(side_effect=RuntimeError("bark down"))),
+            patch(
+                "app.notify._send_bark",
+                new=AsyncMock(
+                    side_effect=RuntimeError(
+                        "failed https://api.day.app/bark-secret/会员购订单待支付/请及时支付",
+                    )
+                ),
+            ),
             patch("app.notify._send_imessage", new=AsyncMock()) as send_imessage,
         ):
-            with self.assertRaisesRegex(RuntimeError, "Bark: bark down"):
+            with self.assertRaises(RuntimeError) as cm:
                 await notify.send_all(config, "会员购订单待支付", "请及时支付")
 
         send_imessage.assert_awaited_once()
+        self.assertIn("Bark:", str(cm.exception))
+        self.assertNotIn("bark-secret", str(cm.exception))
+        self.assertIn("***", str(cm.exception))
 
     async def test_send_imessage_invokes_osascript_with_message_text(self) -> None:
         proc = AsyncMock()
@@ -248,6 +381,77 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         prepare_order.assert_not_awaited()
         self.assertFalse(grabber.status.running)
         self.assertIn("票价无效", grabber.status.finished_reason)
+
+    async def test_price_resolution_uses_selected_screen_and_sku(self) -> None:
+        config = self.make_config()
+        grabber = Grabber(config)
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=201,
+                    name="wrong screen",
+                    skus=[ticket.TicketSku(300, "vip-wrong", 99900, "sale", 1)],
+                ),
+                ticket.Screen(
+                    screen_id=200,
+                    name="selected screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                ),
+            ],
+        )
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+        ):
+            grabber._client = FakeBiliClient(config.cookie)
+            price = await grabber._resolve_price()
+
+        self.assertEqual(price, 8800)
+
+    async def test_buyer_count_must_match_ticket_count(self) -> None:
+        config = self.make_config()
+        config.count = 2
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+
+        with patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)):
+            grabber._client = FakeBiliClient(config.cookie)
+            with self.assertRaisesRegex(RuntimeError, "购票人数必须与购买数量一致"):
+                await grabber._resolve_buyers()
+
+    async def test_missing_buyer_id_stops_before_prepare(self) -> None:
+        events: list[dict] = []
+        config = self.make_config()
+        config.buyer_ids = [1, 2]
+        config.count = 2
+        grabber = Grabber(config, on_event=events.append)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                )
+            ],
+        )
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch("app.grabber.ticket.prepare_order", new=AsyncMock()) as prepare_order,
+        ):
+            await grabber._run()
+
+        prepare_order.assert_not_awaited()
+        self.assertFalse(grabber.status.running)
+        self.assertIn("未匹配到购票人: 2", grabber.status.finished_reason)
 
     async def test_prepare_fatal_error_stops_before_create(self) -> None:
         events: list[dict] = []
@@ -560,6 +764,89 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         _, kwargs = send_all.await_args
         self.assertEqual(kwargs["title"], "会员购订单待支付")
         self.assertIn("请尽快前往 B 站订单页支付", kwargs["body"])
+
+    async def test_duplicate_order_code_triggers_payment_notification(self) -> None:
+        events: list[dict] = []
+        grabber = Grabber(self.make_config(), on_event=events.append)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                )
+            ],
+        )
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch(
+                "app.grabber.ticket.prepare_order",
+                new=AsyncMock(return_value=ok_prepare()),
+            ),
+            patch(
+                "app.grabber.ticket.create_order",
+                new=AsyncMock(
+                    return_value=ticket.CreateResult(
+                        code=100048,
+                        message="已经下单，请勿重复下单",
+                    )
+                ),
+            ),
+            patch("app.grabber.notify.send_all", new=AsyncMock()) as send_all,
+        ):
+            await grabber._run()
+
+        self.assertTrue(grabber.status.success)
+        self.assertEqual(grabber.status.finished_reason, "订单已生成")
+        send_all.assert_awaited_once()
+        _, kwargs = send_all.await_args
+        self.assertEqual(kwargs["title"], "会员购订单待支付")
+        self.assertIn("已经下单，请勿重复下单", kwargs["body"])
+
+    async def test_prepare_duplicate_order_code_triggers_payment_notification(self) -> None:
+        events: list[dict] = []
+        grabber = Grabber(self.make_config(), on_event=events.append)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                )
+            ],
+        )
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch(
+                "app.grabber.ticket.prepare_order",
+                new=AsyncMock(
+                    return_value=ticket.PrepareResult(
+                        code=100048,
+                        message="已经下单，请勿重复下单",
+                    )
+                ),
+            ),
+            patch("app.grabber.ticket.create_order", new=AsyncMock()) as create_order,
+            patch("app.grabber.notify.send_all", new=AsyncMock()) as send_all,
+        ):
+            await grabber._run()
+
+        create_order.assert_not_awaited()
+        self.assertTrue(grabber.status.success)
+        self.assertEqual(grabber.status.finished_reason, "订单已生成")
+        send_all.assert_awaited_once()
 
     async def test_success_order_id_notification_mentions_payment_window(self) -> None:
         events: list[dict] = []

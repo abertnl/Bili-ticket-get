@@ -3,6 +3,7 @@ name = "ticket-buy"
 version = "0.1.0"
 description = "B 站会员购抢票工具（本地 Web 版），仅供个人买票自用"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.115.0",
@@ -13,6 +14,11 @@ dependencies = [
     "pydantic>=2.10.0",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
 [project.scripts]
 ticket-buy = "main:main"
 
@@ -20,5 +26,29 @@ ticket-buy = "main:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+exclude = [
+    "*.pyc",
+    "*.pyo",
+    "*:Zone.Identifier",
+    "/.claude",
+    "/.pytest_cache",
+    "/.venv",
+    "/__pycache__",
+    "**/__pycache__",
+    "/build",
+    "/dist",
+    "/wheels",
+    "/config.json",
+    "/.python-version",
+    "/CLAUDE.md",
+    ".DS_Store",
+    "Thumbs.db",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"main.py" = "main.py"
+"web" = "web"

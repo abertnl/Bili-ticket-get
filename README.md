@@ -26,7 +26,7 @@ Bilibili 会员购（show.bilibili.com）本地抢票工具。基于 FastAPI 的
 
 ```bash
 # 克隆项目
-git clone <repo-url>
+git clone https://github.com/abertnl/Bili-ticket-get.git
 cd Bili-ticket-get
 
 # 安装依赖
@@ -36,7 +36,7 @@ uv sync
 uv run main.py
 ```
 
-浏览器打开 `http://127.0.0.1:8000` 即可使用。
+启动后终端会打印本次临时管理 token。浏览器打开 `http://127.0.0.1:8000` 后输入 token 即可使用。
 
 ### 使用步骤
 
