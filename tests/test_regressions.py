@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import AsyncMock, patch
 
@@ -15,6 +17,35 @@ from app.bili import auth, ticket
 from app.bili.errors import ResultKind, classify
 from app.config import AppConfig, NotifyConfig, ServerConfig
 from app.grabber import AttemptOutcome, Grabber, _has_pending_order
+
+
+def load_entrypoint_module():
+    spec = importlib.util.spec_from_file_location(
+        "ticket_buy_entrypoint_for_test",
+        Path(__file__).resolve().parents[1] / "main.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("无法加载 main.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class StartupOutputTests(unittest.TestCase):
+    def test_configured_admin_token_is_printed_on_startup(self) -> None:
+        entrypoint = load_entrypoint_module()
+        config = AppConfig(server=ServerConfig(admin_token="configured-token-123"))
+        lines: list[str] = []
+
+        with (
+            patch.object(entrypoint, "load_config", return_value=config),
+            patch.object(entrypoint.uvicorn, "run"),
+            patch("builtins.print", side_effect=lines.append),
+        ):
+            entrypoint.main()
+
+        self.assertIn("管理 token：configured-token-123", lines)
+        self.assertIn("token 来源：config.json 的 server.admin_token", lines)
 
 
 class ServerConfigTests(unittest.TestCase):
