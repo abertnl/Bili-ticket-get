@@ -277,6 +277,9 @@ function collectConfig() {
     prewarm_seconds: parseInt($("prewarmSecondsInput").value || "30", 10),
     rate_limit_backoff_ms: parseInt($("rateLimitBackoffInput").value || "2000", 10),
     network_backoff_max_ms: parseInt($("networkBackoffMaxInput").value || "3000", 10),
+    adaptive_rate_enabled: $("adaptiveRateEnabled").checked,
+    max_interval_ms: parseInt($("maxIntervalInput").value || "3000", 10),
+    sold_out_burst_attempts: parseInt($("soldOutBurstInput").value || "6", 10),
     return_monitor_enabled: returnMonitorEnabled,
     monitor_interval_ms: parseInt($("monitorIntervalInput").value || "5000", 10),
     monitor_end_time: collectDateTime(
@@ -318,6 +321,9 @@ async function loadConfig() {
   $("prewarmSecondsInput").value = c.prewarm_seconds ?? 30;
   $("rateLimitBackoffInput").value = c.rate_limit_backoff_ms ?? 2000;
   $("networkBackoffMaxInput").value = c.network_backoff_max_ms ?? 3000;
+  $("adaptiveRateEnabled").checked = c.adaptive_rate_enabled ?? true;
+  $("maxIntervalInput").value = c.max_interval_ms ?? 3000;
+  $("soldOutBurstInput").value = c.sold_out_burst_attempts ?? 6;
   $("returnMonitorEnabled").checked = !!c.return_monitor_enabled;
   $("monitorIntervalInput").value = c.monitor_interval_ms || 5000;
   applyDateTime(c.monitor_end_time, "monitorEndDateInput", "monitorEndTimeInput");
@@ -353,6 +359,8 @@ function applyStatus(s) {
   $("statLastAttemptMs").textContent = `${s.last_attempt_ms ?? 0}ms`;
   $("statAvgAttemptMs").textContent = `${s.avg_attempt_ms ?? 0}ms`;
   $("statNetworkErrors").textContent = s.network_errors ?? 0;
+  $("statRateLimit").textContent = s.rate_limit_count ?? 0;
+  $("statDynamicInterval").textContent = `${s.dynamic_interval_ms ?? 0}ms`;
   $("retryInfo").textContent = s.running && s.retry_reason
     ? `下次重试：${s.retry_reason} · 等待 ${s.retry_delay_ms ?? 0}ms`
     : "";

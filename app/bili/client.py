@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import time
@@ -19,7 +20,14 @@ DEFAULT_UA = (
 DEFAULT_MAX_CONNECTIONS = 10
 DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 5
 
+# 读取演出/票档等信息时，这些状态码多为瞬态（限流/网关抖动），可短退避后重试
+TRANSIENT_STATUS_CODES = frozenset({408, 412, 429, 500, 502, 503, 504})
+
 GEN_WEB_TICKET_URL = "https://api.bilibili.com/bapis/bilibili.api.ticket.v1.Ticket/GenWebTicket"
+
+
+class JsonResponseError(ValueError):
+    """响应无法解析为 JSON。"""
 
 
 def parse_cookie(cookie_str: str) -> dict[str, str]:
@@ -109,12 +117,49 @@ class BiliClient:
         return await self._client.post(url, **kwargs)
 
     async def get_json(self, url: str, **kwargs: Any) -> dict[str, Any]:
-        resp = await self._client.get(url, **kwargs)
-        return resp.json()
+        return await self._request_json_with_retry("GET", url, **kwargs)
 
     async def post_json(self, url: str, **kwargs: Any) -> dict[str, Any]:
-        resp = await self._client.post(url, **kwargs)
-        return resp.json()
+        return await self._request_json_with_retry("POST", url, **kwargs)
+
+    async def _request_json_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        retries: int = 2,
+        backoff: float = 0.3,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """发起请求并解析 JSON，遇瞬态错误（网络抖动/非 JSON 响应/限流状态码）时短退避重试。
+
+        预热阶段拉取演出信息/票档时，B 站偏偷可能返回空 body 或 412/429 页面，
+        导致 ``resp.json()`` 抛 ``JSONDecodeError``。这里有限次重试以避免单次抖动让整个抢票崩溃。
+        """
+
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                resp = await self._client.request(method, url, **kwargs)
+            except httpx.HTTPError as exc:
+                last_exc = exc
+            else:
+                if resp.status_code in TRANSIENT_STATUS_CODES and attempt < retries:
+                    last_exc = RuntimeError(f"HTTP {resp.status_code}")
+                else:
+                    try:
+                        return resp.json()
+                    except ValueError as exc:
+                        last_exc = JsonResponseError(
+                            f"响应不是合法 JSON（HTTP {resp.status_code}）"
+                        )
+                        last_exc.__cause__ = exc
+                        if attempt >= retries:
+                            raise last_exc from exc
+            if attempt < retries:
+                await asyncio.sleep(backoff * (attempt + 1))
+        assert last_exc is not None
+        raise last_exc
 
     # ---- bili_ticket（降低风控触发概率） ----
     async def gen_bili_ticket(self) -> str | None:

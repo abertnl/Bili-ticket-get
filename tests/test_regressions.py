@@ -14,6 +14,7 @@ from app import notify
 from app import server
 from app.bili.captcha import RrocrSolver
 from app.bili import auth, ticket
+from app.bili.client import BiliClient
 from app.bili.errors import ResultKind, classify
 from app.config import AppConfig, NotifyConfig, ServerConfig
 from app.grabber import AttemptOutcome, Grabber, _has_pending_order
@@ -466,6 +467,10 @@ class ErrorClassificationTests(unittest.TestCase):
         self.assertIs(classify(429), ResultKind.RATE_LIMIT)
         self.assertIs(classify(412), ResultKind.RATE_LIMIT)
         self.assertIs(classify(100001), ResultKind.RETRY)
+
+    def test_congestion_codes_are_retryable(self) -> None:
+        self.assertIs(classify(900001), ResultKind.RETRY)
+        self.assertIs(classify(100039), ResultKind.RETRY)
 
 
 class FakeBiliClient:
@@ -1097,6 +1102,7 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
     async def test_sold_out_after_return_monitor_goes_back_to_monitoring(self) -> None:
         config = self.make_config()
         config.return_monitor_enabled = True
+        config.sold_out_burst_attempts = 1
         config.monitor_end_time = self.future_time()
         grabber = Grabber(config)
         buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
@@ -1131,6 +1137,280 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(wait_for_return.await_count, 2)
         create_order.assert_awaited_once()
+
+    def test_aimd_backs_off_on_rate_limit_and_speeds_up_on_retry(self) -> None:
+        config = self.make_config()
+        config.interval_ms = 500
+        config.max_interval_ms = 3000
+        grabber = Grabber(config)
+
+        self.assertAlmostEqual(grabber._dynamic_interval, 0.5)
+        grabber._on_rate_limit()
+        self.assertAlmostEqual(grabber._dynamic_interval, 1.0)
+        grabber._on_rate_limit()
+        self.assertAlmostEqual(grabber._dynamic_interval, 2.0)
+        self.assertEqual(grabber.status.rate_limit_count, 2)
+        self.assertEqual(grabber.status.consecutive_rate_limits, 2)
+
+        grabber._on_retryable()
+        self.assertAlmostEqual(grabber._dynamic_interval, 1.95)
+        self.assertEqual(grabber.status.consecutive_rate_limits, 0)
+
+        for _ in range(200):
+            grabber._on_retryable()
+        self.assertAlmostEqual(grabber._dynamic_interval, 0.5)
+
+        for _ in range(200):
+            grabber._on_rate_limit()
+        self.assertAlmostEqual(grabber._dynamic_interval, 3.0)
+
+    def test_aimd_disabled_keeps_fixed_interval(self) -> None:
+        config = self.make_config()
+        config.interval_ms = 500
+        config.adaptive_rate_enabled = False
+        grabber = Grabber(config)
+
+        grabber._on_rate_limit()
+        self.assertAlmostEqual(grabber._dynamic_interval, 0.5)
+        self.assertAlmostEqual(grabber._retry_delay(), 0.5)
+
+    async def test_sold_out_bursts_n_times_before_returning_to_monitor(self) -> None:
+        config = self.make_config()
+        config.return_monitor_enabled = True
+        config.sold_out_burst_attempts = 3
+        config.max_attempts = 10
+        config.monitor_end_time = self.future_time()
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "销售中", 1)],
+                )
+            ],
+        )
+        wait_for_return = AsyncMock(side_effect=[True, False])
+        create_order = AsyncMock(return_value=ticket.CreateResult(code=100009, message="库存不足"))
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch("app.grabber.Grabber._wait_for_return_ticket", new=wait_for_return),
+            patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
+            patch("app.grabber.ticket.create_order", new=create_order),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()),
+        ):
+            await grabber._run()
+
+        self.assertEqual(create_order.await_count, 3)
+        self.assertEqual(wait_for_return.await_count, 2)
+        self.assertEqual(grabber.status.sold_out_count, 3)
+
+    async def test_prewarm_resolution_retries_transient_failure(self) -> None:
+        config = self.make_config()
+        grabber = Grabber(config)
+        grabber._client = FakeBiliClient(config.cookie)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                )
+            ],
+        )
+        get_project = AsyncMock(
+            side_effect=[RuntimeError("Expecting value: line 1 column 1 (char 0)"), project]
+        )
+
+        with (
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=get_project),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+        ):
+            resolved_buyers, price = await grabber._resolve_prewarm_data()
+
+        self.assertEqual(price, 8800)
+        self.assertEqual(len(resolved_buyers), 1)
+        self.assertEqual(get_project.await_count, 2)
+        sleep_mock.assert_awaited()
+
+    async def test_prewarm_resolution_does_not_retry_config_errors(self) -> None:
+        config = self.make_config()
+        config.buyer_ids = [1, 2]
+        config.count = 2
+        grabber = Grabber(config)
+        grabber._client = FakeBiliClient(config.cookie)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                )
+            ],
+        )
+        get_buyers = AsyncMock(return_value=buyers)
+
+        with (
+            patch("app.grabber.ticket.get_buyers", new=get_buyers),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "未匹配到购票人"):
+                await grabber._resolve_prewarm_data()
+
+        self.assertEqual(get_buyers.await_count, 1)
+        sleep_mock.assert_not_awaited()
+
+    async def test_prepare_token_reused_on_congestion(self) -> None:
+        config = self.make_config()
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                )
+            ],
+        )
+        prepare_order = AsyncMock(return_value=ok_prepare())
+        create_order = AsyncMock(return_value=ticket.CreateResult(code=100001, message="系统繁忙"))
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch("app.grabber.ticket.prepare_order", new=prepare_order),
+            patch("app.grabber.ticket.create_order", new=create_order),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()),
+        ):
+            await grabber._run()
+
+        self.assertEqual(prepare_order.await_count, 1)
+        self.assertEqual(create_order.await_count, 2)
+        self.assertEqual(grabber.status.congestion_count, 2)
+
+    async def test_prepare_token_not_reused_after_rate_limit(self) -> None:
+        config = self.make_config()
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                )
+            ],
+        )
+        prepare_order = AsyncMock(return_value=ok_prepare())
+        create_order = AsyncMock(return_value=ticket.CreateResult(code=429, message="请求过于频繁"))
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch("app.grabber.ticket.prepare_order", new=prepare_order),
+            patch("app.grabber.ticket.create_order", new=create_order),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()),
+        ):
+            await grabber._run()
+
+        self.assertEqual(prepare_order.await_count, 2)
+        self.assertEqual(create_order.await_count, 2)
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload: dict | None = None, raise_json: bool = False) -> None:
+        self.status_code = status_code
+        self._payload = payload or {}
+        self._raise_json = raise_json
+
+    def json(self) -> dict:
+        if self._raise_json:
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+        return self._payload
+
+
+class ClientResilienceTests(unittest.IsolatedAsyncioTestCase):
+    def make_client(self) -> BiliClient:
+        return BiliClient("SESSDATA=s; bili_jct=c; DedeUserID=1")
+
+    async def test_get_json_retries_non_json_response(self) -> None:
+        client = self.make_client()
+        request = AsyncMock(
+            side_effect=[
+                _FakeResponse(200, raise_json=True),
+                _FakeResponse(200, payload={"code": 0}),
+            ]
+        )
+        with (
+            patch.object(client._client, "request", new=request),
+            patch("app.bili.client.asyncio.sleep", new=AsyncMock()),
+        ):
+            data = await client.get_json("https://example.invalid/x")
+        self.assertEqual(data, {"code": 0})
+        self.assertEqual(request.await_count, 2)
+        await client.aclose()
+
+    async def test_get_json_retries_transient_status(self) -> None:
+        client = self.make_client()
+        request = AsyncMock(
+            side_effect=[
+                _FakeResponse(429),
+                _FakeResponse(200, payload={"code": 0}),
+            ]
+        )
+        with (
+            patch.object(client._client, "request", new=request),
+            patch("app.bili.client.asyncio.sleep", new=AsyncMock()),
+        ):
+            data = await client.get_json("https://example.invalid/x")
+        self.assertEqual(data, {"code": 0})
+        self.assertEqual(request.await_count, 2)
+        await client.aclose()
+
+    async def test_gen_bili_ticket_ignores_non_json_response(self) -> None:
+        client = self.make_client()
+        request = AsyncMock(return_value=_FakeResponse(200, raise_json=True))
+        with (
+            patch.object(client._client, "request", new=request),
+            patch("app.bili.client.asyncio.sleep", new=AsyncMock()),
+        ):
+            ticket_value = await client.gen_bili_ticket()
+        self.assertIsNone(ticket_value)
+        self.assertEqual(request.await_count, 3)
+        await client.aclose()
+
+    async def test_get_json_raises_after_exhausting_retries(self) -> None:
+        client = self.make_client()
+        request = AsyncMock(return_value=_FakeResponse(200, raise_json=True))
+        with (
+            patch.object(client._client, "request", new=request),
+            patch("app.bili.client.asyncio.sleep", new=AsyncMock()),
+        ):
+            with self.assertRaises(ValueError):
+                await client.get_json("https://example.invalid/x")
+        self.assertEqual(request.await_count, 3)
+        await client.aclose()
 
 
 if __name__ == "__main__":
