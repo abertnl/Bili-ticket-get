@@ -6,15 +6,18 @@ import base64
 import io
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 import qrcode
 
-from .client import DEFAULT_UA, BiliClient
+from .client import DEFAULT_UA, BiliClient, parse_cookie
 
 QR_GENERATE_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
 QR_POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
+QR_SOURCE = "scan-web"
+REQUIRED_COOKIE_KEYS = ("SESSDATA", "bili_jct", "DedeUserID")
 
 
 @dataclass
@@ -48,19 +51,46 @@ def _render_qr(url: str) -> str:
     return f"data:image/png;base64,{b64}"
 
 
+def _normalize_scan_url(url: str) -> str:
+    """Ensure B 站扫码页拿到明确来源，避免 App 端校验失败。"""
+
+    parsed = urlparse(url)
+    if parsed.netloc != "account.bilibili.com" or parsed.path != "/h5/account-h5/auth/scan-web":
+        return url
+
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    has_from = False
+    normalized_query: list[tuple[str, str]] = []
+    for key, value in query:
+        if key == "from":
+            has_from = True
+            normalized_query.append((key, value or QR_SOURCE))
+        else:
+            normalized_query.append((key, value))
+    if not has_from:
+        normalized_query.append(("from", QR_SOURCE))
+    return urlunparse(parsed._replace(query=urlencode(normalized_query)))
+
+
+def missing_required_cookie_keys(cookie: str) -> list[str]:
+    jar = parse_cookie(cookie)
+    return [key for key in REQUIRED_COOKIE_KEYS if not jar.get(key)]
+
+
 async def generate_qr() -> QrCode:
     """生成扫码登录二维码。"""
 
     async with httpx.AsyncClient(headers={"User-Agent": DEFAULT_UA}, timeout=10.0) as client:
-        resp = await client.get(QR_GENERATE_URL)
+        resp = await client.get(QR_GENERATE_URL, params={"source": QR_SOURCE})
         data = resp.json()
     if data.get("code") != 0:
         raise RuntimeError(f"生成二维码失败: {data.get('message')}")
     payload = data["data"]
+    url = _normalize_scan_url(payload["url"])
     return QrCode(
         qrcode_key=payload["qrcode_key"],
-        url=payload["url"],
-        image_base64=_render_qr(payload["url"]),
+        url=url,
+        image_base64=_render_qr(url),
     )
 
 

@@ -1,6 +1,13 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
+let authRedirecting = false;
+function redirectToAuth() {
+  if (authRedirecting) return;
+  authRedirecting = true;
+  location.replace("/");
+}
+
 const api = async (url, opts) => {
   const response = await fetch(url, opts);
   const text = await response.text();
@@ -16,6 +23,10 @@ const api = async (url, opts) => {
     data.ok = false;
     data.status = response.status;
     data.message = data.message || data.detail || `请求失败：HTTP ${response.status}`;
+    if (response.status === 401 && data.message.startsWith("未授权：")) {
+      redirectToAuth();
+      throw new Error(data.message);
+    }
   }
   return data;
 };
@@ -144,9 +155,7 @@ function applyDateTime(value, dateId, timeId) {
   $(timeId).value = time.slice(0, 8);
 }
 
-$("loadProjectBtn").addEventListener("click", async () => {
-  const pid = parseProjectId($("projectInput").value);
-  if (!pid) return alert("无法识别 project_id");
+async function loadProject(pid, selectedScreenId = 0, selectedSkuId = 0) {
   $("projectInfo").textContent = "加载中…";
   try {
     const p = await api("/api/project?project_id=" + pid);
@@ -165,13 +174,22 @@ $("loadProjectBtn").addEventListener("click", async () => {
       o.dataset.skus = JSON.stringify(s.skus);
       screenSel.appendChild(o);
     });
-    renderSkus();
+    if (selectedScreenId && [...screenSel.options].some((o) => parseInt(o.value, 10) === selectedScreenId)) {
+      screenSel.value = String(selectedScreenId);
+    }
+    renderSkus(selectedSkuId);
   } catch (e) {
     $("projectInfo").textContent = "加载失败：" + e.message;
   }
+}
+
+$("loadProjectBtn").addEventListener("click", async () => {
+  const pid = parseProjectId($("projectInput").value);
+  if (!pid) return alert("无法识别 project_id");
+  await loadProject(pid);
 });
 
-function renderSkus() {
+function renderSkus(selectedSkuId = 0) {
   const opt = $("screenSelect").selectedOptions[0];
   const skuSel = $("skuSelect");
   skuSel.innerHTML = "";
@@ -182,16 +200,46 @@ function renderSkus() {
     o.textContent = `${k.desc} ￥${(k.price / 100).toFixed(2)} ${k.sale_flag || ""}`;
     skuSel.appendChild(o);
   });
+  if (selectedSkuId && [...skuSel.options].some((o) => parseInt(o.value, 10) === selectedSkuId)) {
+    skuSel.value = String(selectedSkuId);
+  }
 }
-$("screenSelect").addEventListener("change", renderSkus);
+$("screenSelect").addEventListener("change", () => renderSkus());
 
-$("loadBuyersBtn").addEventListener("click", async () => {
+function setSavedSelect(selectId, value, label) {
+  const select = $(selectId);
+  select.innerHTML = "";
+  if (!value) return;
+  const option = document.createElement("option");
+  option.value = value;
+  option.textContent = `已保存${label} ID ${value}`;
+  select.appendChild(option);
+}
+
+function renderSavedBuyerIds(ids) {
+  const box = $("buyerList");
+  box.innerHTML = "";
+  (ids || []).forEach((id) => {
+    const label = document.createElement("label");
+    label.className = "buyer-item";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = id;
+    cb.checked = true;
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(` 已保存购票人 ID ${id}`));
+    box.appendChild(label);
+  });
+}
+
+async function loadBuyers(selectedBuyerIds = []) {
   const box = $("buyerList");
   box.textContent = "加载中…";
   try {
     const r = await api("/api/buyers");
     if (!r.ok) throw new Error(r.message || "加载购票人失败");
     const buyers = r.buyers || [];
+    const selected = new Set((selectedBuyerIds || []).map((id) => Number(id)));
     box.innerHTML = "";
     buyers.forEach((b) => {
       const label = document.createElement("label");
@@ -199,6 +247,7 @@ $("loadBuyersBtn").addEventListener("click", async () => {
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.value = b.buyer_id;
+      cb.checked = selected.has(Number(b.buyer_id));
       label.appendChild(cb);
       label.appendChild(document.createTextNode(` ${b.name} · ${b.tel} · ${b.id_card}`));
       box.appendChild(label);
@@ -207,6 +256,10 @@ $("loadBuyersBtn").addEventListener("click", async () => {
   } catch (e) {
     box.textContent = e.message || "加载购票人失败，请确认已登录";
   }
+}
+
+$("loadBuyersBtn").addEventListener("click", async () => {
+  await loadBuyers();
 });
 
 function collectConfig() {
@@ -256,6 +309,9 @@ $("saveConfigBtn").addEventListener("click", async () => {
 async function loadConfig() {
   const c = await api("/api/config");
   if (c.project_id) $("projectInput").value = c.project_id;
+  setSavedSelect("screenSelect", c.screen_id || 0, "场次");
+  setSavedSelect("skuSelect", c.sku_id || 0, "票档");
+  renderSavedBuyerIds(c.buyer_ids || []);
   $("countInput").value = c.count || 1;
   $("intervalInput").value = c.interval_ms || 800;
   $("maxAttemptsInput").value = c.max_attempts || 300;
@@ -272,6 +328,9 @@ async function loadConfig() {
     $("barkUrl").value = c.notify.bark_url || "";
     $("serverchanKey").value = c.notify.serverchan_key || "";
     $("imessageRecipient").value = c.notify.imessage_recipient || "";
+  }
+  if (c.project_id) {
+    await loadProject(c.project_id, c.screen_id || 0, c.sku_id || 0);
   }
 }
 
@@ -305,15 +364,29 @@ function applyStatus(s) {
 }
 
 let ws = null;
+let wsReconnectTimer = null;
 function connectWS() {
+  if (authRedirecting || ws) return;
+  let opened = false;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => {
+    opened = true;
+  };
   ws.onmessage = (e) => {
     const ev = JSON.parse(e.data);
     if (ev.type === "log") addLog(ev);
     else if (ev.type === "status") applyStatus(ev);
   };
-  ws.onclose = () => setTimeout(connectWS, 2000);
+  ws.onclose = (event) => {
+    ws = null;
+    if (authRedirecting || event.code === 1008 || !opened) {
+      redirectToAuth();
+      return;
+    }
+    if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = setTimeout(connectWS, 2000);
+  };
 }
 
 $("startBtn").addEventListener("click", async () => {
@@ -367,10 +440,10 @@ $("capSubmit").addEventListener("click", async () => {
 
 // ---------- 初始化 ----------
 (async function init() {
-  connectWS();
   try {
     await loadConfig();
     setUser(await api("/api/login/status"));
+    connectWS();
   } catch (e) {
     console.warn("初始化失败:", e);
   }

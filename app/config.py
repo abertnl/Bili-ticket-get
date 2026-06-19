@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import ipaddress
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -40,10 +41,27 @@ class NotifyConfig(BaseModel):
         if not value:
             return value
         parsed = urlparse(value)
-        if parsed.scheme != "https" or parsed.hostname != "api.day.app":
-            raise ValueError("Bark URL 仅允许 https://api.day.app/...")
-        if parsed.username or parsed.password or parsed.port:
-            raise ValueError("Bark URL 不能包含用户名、密码或端口")
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError("Bark URL 必须是 https 地址")
+        if parsed.username or parsed.password:
+            raise ValueError("Bark URL 不能包含用户名或密码")
+        hostname = parsed.hostname.lower()
+        if hostname == "localhost" or hostname.endswith(".localhost"):
+            raise ValueError("Bark URL 不能指向本机地址")
+        try:
+            ip = ipaddress.ip_address(hostname)
+        except ValueError:
+            pass
+        else:
+            if (
+                ip.is_loopback
+                or ip.is_private
+                or ip.is_link_local
+                or ip.is_unspecified
+                or ip.is_multicast
+                or ip.is_reserved
+            ):
+                raise ValueError("Bark URL 不能指向本地或内网地址")
         return value.rstrip("/")
 
     @field_validator("serverchan_key")

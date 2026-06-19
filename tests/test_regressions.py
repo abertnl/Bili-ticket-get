@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import importlib.util
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
@@ -10,10 +13,39 @@ from starlette.websockets import WebSocketDisconnect
 from app import notify
 from app import server
 from app.bili.captcha import RrocrSolver
-from app.bili import ticket
+from app.bili import auth, ticket
 from app.bili.errors import ResultKind, classify
 from app.config import AppConfig, NotifyConfig, ServerConfig
 from app.grabber import AttemptOutcome, Grabber, _has_pending_order
+
+
+def load_entrypoint_module():
+    spec = importlib.util.spec_from_file_location(
+        "ticket_buy_entrypoint_for_test",
+        Path(__file__).resolve().parents[1] / "main.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("无法加载 main.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class StartupOutputTests(unittest.TestCase):
+    def test_configured_admin_token_is_printed_on_startup(self) -> None:
+        entrypoint = load_entrypoint_module()
+        config = AppConfig(server=ServerConfig(admin_token="configured-token-123"))
+        lines: list[str] = []
+
+        with (
+            patch.object(entrypoint, "load_config", return_value=config),
+            patch.object(entrypoint.uvicorn, "run"),
+            patch("builtins.print", side_effect=lines.append),
+        ):
+            entrypoint.main()
+
+        self.assertIn("管理 token：configured-token-123", lines)
+        self.assertIn("token 来源：config.json 的 server.admin_token", lines)
 
 
 class ServerConfigTests(unittest.TestCase):
@@ -42,7 +74,7 @@ class ServerConfigTests(unittest.TestCase):
         self.assertNotIn("rrocr_token", data)
         self.assertEqual(
             data["notify"],
-            {"bark_url": "", "serverchan_key": "", "imessage_recipient": ""},
+            {"bark_url": "***", "serverchan_key": "***", "imessage_recipient": "***"},
         )
         self.assertTrue(data["has_cookie"])
         self.assertTrue(data["has_rrocr_token"])
@@ -84,6 +116,26 @@ class ServerConfigTests(unittest.TestCase):
         self.assertEqual(bad.status_code, 401)
         self.assertEqual(good.status_code, 200)
         self.assertEqual(response.status_code, 200)
+
+    def test_static_frontend_requires_fresh_admin_cookie(self) -> None:
+        server.state.config = AppConfig(
+            server=ServerConfig(admin_token=self.admin_token),
+        )
+        plain_client = TestClient(server.app)
+        plain_client.cookies.set(server.ADMIN_COOKIE_NAME, "stale-token")
+
+        response = plain_client.get("/")
+        index_response = plain_client.get("/index.html")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("管理验证", response.text)
+        self.assertNotIn("/app.js", response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(index_response.status_code, 200)
+        self.assertIn("管理验证", index_response.text)
+        self.assertNotIn("/app.js", index_response.text)
+        self.assertEqual(index_response.headers["cache-control"], "no-store")
+        self.assertNotIn("会员购抢票工具</h1>", response.text)
 
     def test_websocket_requires_admin_token(self) -> None:
         server.state.config = AppConfig(
@@ -158,7 +210,7 @@ class ServerConfigTests(unittest.TestCase):
         limited = plain_client.post("/auth/token", data={"token": "wrong"})
         self.assertEqual(limited.status_code, 429)
 
-    def test_empty_sensitive_update_preserves_existing_values(self) -> None:
+    def test_empty_rrocr_token_preserves_existing_value(self) -> None:
         with patch("app.server.save_config"):
             response = self.client.post(
                 "/api/config",
@@ -172,7 +224,38 @@ class ServerConfigTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["config"]["count"], 2)
         self.assertEqual(server.state.config.rrocr_token, "rrocr-secret")
+
+    def test_notify_placeholders_preserve_values_and_empty_fields_clear_channels(self) -> None:
+        with patch("app.server.save_config"):
+            response = self.client.post(
+                "/api/config",
+                json={
+                    "notify": {
+                        "bark_url": "***",
+                        "serverchan_key": "",
+                        "imessage_recipient": "***",
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(server.state.config.notify.bark_url, "https://api.day.app/bark-secret")
+        self.assertEqual(server.state.config.notify.serverchan_key, "")
+        self.assertEqual(server.state.config.notify.imessage_recipient, "+15555550123")
+        self.assertEqual(
+            response.json()["config"]["notify"],
+            {"bark_url": "***", "serverchan_key": "", "imessage_recipient": "***"},
+        )
+
+    def test_custom_https_bark_url_is_allowed(self) -> None:
+        with patch("app.server.save_config"):
+            response = self.client.post(
+                "/api/config",
+                json={"notify": {"bark_url": "https://push.example.com:8443/bark-secret"}},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(server.state.config.notify.bark_url, "https://push.example.com:8443/bark-secret")
         self.assertEqual(server.state.config.notify.serverchan_key, "SCT-secret")
         self.assertEqual(server.state.config.notify.imessage_recipient, "+15555550123")
 
@@ -213,6 +296,18 @@ class ServerConfigTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["ok"], False)
         self.assertIn("offline", response.json()["message"])
+
+    def test_cookie_login_requires_sessdata_csrf_and_uid(self) -> None:
+        with patch("app.server.auth.get_nav_info", new=AsyncMock(return_value={"is_login": True})) as get_nav_info:
+            response = self.client.post(
+                "/api/login/cookie",
+                json={"cookie": "SESSDATA=secret; DedeUserID=1"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["ok"], False)
+        self.assertIn("bili_jct", response.json()["message"])
+        get_nav_info.assert_not_awaited()
 
     def test_grab_start_rejects_incomplete_local_config(self) -> None:
         response = self.client.post("/api/grab/start")
@@ -307,6 +402,63 @@ class NotifyTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.notify.asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
             with self.assertRaisesRegex(RuntimeError, "未授权"):
                 await notify._send_imessage("+15555550123", "会员购订单待支付", "请及时支付")
+
+
+class AuthQrTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generate_qr_requests_scan_web_source_and_fills_empty_from(self) -> None:
+        instances = []
+
+        class FakeResponse:
+            def json(self) -> dict:
+                return {
+                    "code": 0,
+                    "message": "OK",
+                    "data": {
+                        "qrcode_key": "qr-key",
+                        "url": (
+                            "https://account.bilibili.com/h5/account-h5/auth/scan-web"
+                            "?navhide=1&callback=close&qrcode_key=qr-key&from="
+                        ),
+                    },
+                }
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs) -> None:
+                self.get_calls = []
+                instances.append(self)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc) -> None:
+                return None
+
+            async def get(self, url: str, **kwargs):
+                self.get_calls.append((url, kwargs))
+                return FakeResponse()
+
+        with (
+            patch("app.bili.auth.httpx.AsyncClient", FakeAsyncClient),
+            patch("app.bili.auth._render_qr", return_value="data:image/png;base64,test") as render_qr,
+        ):
+            qr = await auth.generate_qr()
+
+        self.assertEqual(instances[0].get_calls[0][1]["params"], {"source": "scan-web"})
+        parsed = urlparse(qr.url)
+        self.assertEqual(parsed.netloc, "account.bilibili.com")
+        self.assertEqual(parse_qs(parsed.query)["from"], ["scan-web"])
+        render_qr.assert_called_once_with(qr.url)
+        self.assertEqual(qr.image_base64, "data:image/png;base64,test")
+
+
+class FrontendAuthFlowTests(unittest.TestCase):
+    def test_frontend_waits_for_config_before_opening_websocket(self) -> None:
+        source = (server.WEB_DIR / "app.js").read_text(encoding="utf-8")
+        init_start = source.index("(async function init()")
+        init_source = source[init_start:]
+
+        self.assertLess(init_source.index("await loadConfig();"), init_source.index("connectWS();"))
+        self.assertNotIn("ws.onclose = () => setTimeout(connectWS, 2000);", source)
 
 
 class ErrorClassificationTests(unittest.TestCase):
