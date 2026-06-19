@@ -24,6 +24,7 @@ from .grabber import Grabber
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 ADMIN_COOKIE_NAME = "ticket_buy_admin"
+SENSITIVE_PLACEHOLDER = "***"
 AUTH_BODY_MAX_BYTES = 1024
 AUTH_FAILURE_LIMIT = 5
 AUTH_FAILURE_WINDOW_SECONDS = 60.0
@@ -77,6 +78,26 @@ class CaptchaSubmit(BaseModel):
     seccode: str = Field(max_length=2048)
 
 
+class NotifyUpdate(BaseModel):
+    bark_url: str = Field(default="", max_length=2048)
+    serverchan_key: str = Field(default="", max_length=128)
+    imessage_recipient: str = Field(default="", max_length=256)
+
+    @field_validator("bark_url")
+    @classmethod
+    def validate_bark_url(cls, value: str) -> str:
+        if value == SENSITIVE_PLACEHOLDER:
+            return value
+        return NotifyConfig.validate_bark_url(value)
+
+    @field_validator("serverchan_key")
+    @classmethod
+    def validate_serverchan_key(cls, value: str) -> str:
+        if value == SENSITIVE_PLACEHOLDER:
+            return value
+        return NotifyConfig.validate_serverchan_key(value)
+
+
 class ConfigUpdate(BaseModel):
     """允许通过配置接口修改的字段白名单。"""
 
@@ -96,7 +117,7 @@ class ConfigUpdate(BaseModel):
     monitor_end_time: str | None = Field(default=None, max_length=64)
     captcha_mode: Literal["manual", "rrocr"] | None = None
     rrocr_token: str | None = Field(default=None, max_length=512)
-    notify: NotifyConfig | None = None
+    notify: NotifyUpdate | None = None
 
     @field_validator("buyer_ids")
     @classmethod
@@ -114,7 +135,11 @@ def _public_config(config: AppConfig) -> dict[str, Any]:
     data["has_cookie"] = bool(config.cookie)
     data["has_rrocr_token"] = bool(config.rrocr_token)
     data["admin_token_required"] = _admin_token_required()
-    data["notify"] = {"bark_url": "", "serverchan_key": "", "imessage_recipient": ""}
+    data["notify"] = {
+        "bark_url": SENSITIVE_PLACEHOLDER if config.notify.bark_url else "",
+        "serverchan_key": SENSITIVE_PLACEHOLDER if config.notify.serverchan_key else "",
+        "imessage_recipient": SENSITIVE_PLACEHOLDER if config.notify.imessage_recipient else "",
+    }
     data["notify_configured"] = {
         "bark_url": bool(config.notify.bark_url),
         "serverchan_key": bool(config.notify.serverchan_key),
@@ -243,17 +268,27 @@ def _login_page() -> Response:
     )
 
 
+def _login_page_with_cleared_cookie() -> Response:
+    response = _login_page()
+    response.delete_cookie(ADMIN_COOKIE_NAME)
+    return response
+
+
 def _merge_sensitive_updates(updates: dict[str, Any]) -> dict[str, Any]:
-    """空敏感字段表示前端未改动，保留旧值。"""
+    """敏感字段占位符表示保留旧值，空字符串表示清空。"""
 
     if updates.get("rrocr_token") == "":
         updates.pop("rrocr_token")
     notify = updates.get("notify")
     if isinstance(notify, dict):
         current = state.config.notify.model_dump()
-        for key, value in list(notify.items()):
-            if value == "":
-                notify[key] = current.get(key, "")
+        merged_notify = current.copy()
+        for key, value in notify.items():
+            if value == SENSITIVE_PLACEHOLDER:
+                merged_notify[key] = current.get(key, "")
+            else:
+                merged_notify[key] = value
+        updates["notify"] = merged_notify
     return updates
 
 
@@ -310,11 +345,15 @@ app = FastAPI(title="B 站会员购抢票工具", lifespan=lifespan)
 
 @app.middleware("http")
 async def require_admin_token(request: Request, call_next):
+    if request.url.path == "/auth/token":
+        return await call_next(request)
     if request.url.path.startswith("/api/"):
         if not _origin_allowed(request.headers.get("origin"), request.headers.get("host")):
             return _error("未授权：来源不被允许", 403)
         if not _request_authorized(request):
             return _error("未授权：请提供管理 token", 401)
+    elif not _request_authorized(request):
+        return _login_page_with_cleared_cookie()
     return await call_next(request)
 
 
@@ -322,7 +361,7 @@ async def require_admin_token(request: Request, call_next):
 @app.get("/")
 async def index(request: Request) -> Response:
     if not _request_authorized(request):
-        return _login_page()
+        return _login_page_with_cleared_cookie()
     return FileResponse(WEB_DIR / "index.html")
 
 
@@ -383,6 +422,9 @@ async def login_poll(qrcode_key: str = Query(max_length=256)) -> Any:
 
 @app.post("/api/login/cookie")
 async def login_cookie(body: CookieLogin) -> JSONResponse:
+    missing = auth.missing_required_cookie_keys(body.cookie)
+    if missing:
+        return _error(f"Cookie 缺少必需字段: {', '.join(missing)}", 400)
     try:
         info = await auth.get_nav_info(body.cookie)
     except Exception as exc:  # noqa: BLE001
@@ -413,7 +455,7 @@ async def get_config() -> dict[str, Any]:
 @app.post("/api/config")
 async def update_config(body: ConfigUpdate) -> Any:
     # 只更新客户端显式传入的字段（排除 None），其余保留原值
-    updates = _merge_sensitive_updates(body.model_dump(exclude_none=True))
+    updates = _merge_sensitive_updates(body.model_dump(exclude_unset=True, exclude_none=True))
     merged = state.config.model_dump()
     merged.update(updates)
     try:
