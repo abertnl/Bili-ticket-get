@@ -88,6 +88,14 @@
           <div class="row"><label>请求间隔(ms)</label><input type="number" id="intervalInput" min="100" value="800" /></div>
           <div class="row"><label>最大尝试次数</label><input type="number" id="maxAttemptsInput" min="1" value="300" /></div>
           <div class="row">
+            <label class="check-row">
+              <input type="checkbox" id="adaptiveRateEnabled" checked />
+              自适应限速(AIMD)
+            </label>
+            <p class="field-hint">遇 429/412 自动退避、顺畅时逐步加速；建议请求间隔不低于 500ms。</p>
+          </div>
+          <div class="row"><label>间隔上限(ms)</label><input type="number" id="maxIntervalInput" min="100" value="3000" /></div>
+          <div class="row">
             <label>预热提前量(s)</label>
             <input type="number" id="prewarmSecondsInput" min="0" value="30" />
             <p class="field-hint">到点前预先刷新凭据、加载购票人和票价。</p>
@@ -108,6 +116,11 @@
             <p class="field-hint">售罄期间低频监控票档，发现疑似可售后自动进入下单冲刺。</p>
           </div>
           <div class="row"><label>监控间隔(ms)</label><input type="number" id="monitorIntervalInput" min="1000" value="5000" /></div>
+          <div class="row">
+            <label>库存不足连冲次数</label>
+            <input type="number" id="soldOutBurstInput" min="1" value="6" />
+            <p class="field-hint">下单遇库存不足时连续冲刺多少次再回到回流监控。</p>
+          </div>
           <div class="row">
             <label>监控截止时间</label>
             <div class="time-pair">
@@ -146,6 +159,8 @@
             <div class="stat"><span class="num" id="statLastAttemptMs">0ms</span><span class="lbl">最近耗时</span></div>
             <div class="stat"><span class="num" id="statAvgAttemptMs">0ms</span><span class="lbl">平均耗时</span></div>
             <div class="stat"><span class="num" id="statNetworkErrors">0</span><span class="lbl">网络异常</span></div>
+            <div class="stat"><span class="num" id="statRateLimit">0</span><span class="lbl">限流次数</span></div>
+            <div class="stat"><span class="num" id="statDynamicInterval">0ms</span><span class="lbl">当前间隔</span></div>
           </div>
           <div class="controls">
             <button class="btn" id="startBtn">保存并开始抢票</button>

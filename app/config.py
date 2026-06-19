@@ -108,11 +108,14 @@ class AppConfig(BaseModel):
     count: int = 1
 
     start_time: str = Field(default="", max_length=64, description="ISO 时间，如 2026-06-08T20:00:00，留空表示立即开抢")
-    interval_ms: int = Field(default=800, ge=100, description="两次下单请求最小间隔（毫秒）")
+    interval_ms: int = Field(default=800, ge=100, description="两次下单请求最小间隔（毫秒），启用自适应限速时作为间隔下限")
     max_attempts: int = Field(default=300, ge=1, description="最大尝试次数")
     prewarm_seconds: int = Field(default=30, ge=0, description="开抢前多少秒执行购票人/票价等预热")
     rate_limit_backoff_ms: int = Field(default=2000, ge=1000, description="遇到 429/412 等限流响应时的最小退避（毫秒）")
     network_backoff_max_ms: int = Field(default=3000, ge=100, description="网络异常指数退避的最大等待（毫秒）")
+    adaptive_rate_enabled: bool = Field(default=True, description="启用 AIMD 自适应限速：遇 429/412 退避，顺畅时逐步加速")
+    max_interval_ms: int = Field(default=3000, ge=100, description="自适应限速的间隔上限（毫秒），interval_ms 为下限")
+    sold_out_burst_attempts: int = Field(default=6, ge=1, description="启用回流监控时，下单遇库存不足连续冲刺多少次再回监控")
     return_monitor_enabled: bool = Field(default=False, description="是否启用回流票低频监控")
     monitor_interval_ms: int = Field(default=5000, ge=1000, description="回流票监控间隔（毫秒）")
     monitor_end_time: str = Field(default="", max_length=64, description="回流票监控截止时间，ISO 格式")

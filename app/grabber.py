@@ -21,6 +21,9 @@ from .config import AppConfig
 # 日志事件回调：接收一个 dict 事件（type/level/message/...）
 EventCallback = Callable[[dict[str, Any]], None]
 
+# prepare token 最长复用时长（秒）：仅在拥堵可重试时短时复用，减半请求量
+_TOKEN_REUSE_SECONDS = 2.5
+
 
 class AttemptOutcome(str, Enum):
     """一次下单尝试后的状态机动作。"""
@@ -60,6 +63,11 @@ class GrabberStatus:
     order_id: str = ""
     waiting_captcha: bool = False
     finished_reason: str = ""
+    congestion_count: int = 0
+    rate_limit_count: int = 0
+    sold_out_count: int = 0
+    consecutive_rate_limits: int = 0
+    dynamic_interval_ms: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -78,6 +86,9 @@ class Grabber:
         self._client: BiliClient | None = None
         self._attempt_ms_total = 0
         self._consecutive_network_errors = 0
+        self._dynamic_interval = self._interval_seconds()
+        self._cached_token = ""
+        self._cached_token_at = 0.0
 
     # ---- 日志 ----
     def _emit(self, message: str, level: str = "info", **extra: Any) -> None:
@@ -197,6 +208,29 @@ class Grabber:
             raise RuntimeError(f"获取演出信息失败: {exc}") from exc
         return self._find_target_sku(project).price
 
+    async def _resolve_prewarm_data(self) -> tuple[list[ticket.Buyer], int]:
+        """预热阶段解析购票人与票价；遇瞬态错误时有限次重试，配置类错误立即抛出。
+
+        日志中曾出现单次 ``获取演出信息失败: Expecting value`` 让整个抢票崩溃，这里在
+        预热窗口内重试若干次，避免一次网络/响应抖动让任务中断。
+        """
+
+        max_resolve = 3
+        for attempt in range(1, max_resolve + 1):
+            try:
+                buyers, pay_money = await asyncio.gather(
+                    self._resolve_buyers(), self._resolve_price()
+                )
+                if pay_money <= 0:
+                    raise RuntimeError("票价无效，请重新加载演出并选择票档")
+                return buyers, pay_money
+            except Exception as exc:  # noqa: BLE001
+                if _is_permanent_resolve_error(exc) or attempt >= max_resolve:
+                    raise
+                self._emit(f"预热数据获取失败，重试（{attempt}/{max_resolve}）: {exc}", "warn")
+                await asyncio.sleep(min(1.0 * attempt, 3.0))
+        raise RuntimeError("预热数据获取失败")  # 理论不可达，满足类型检查
+
     def _parse_local_time(self, value: str, label: str) -> datetime | None:
         if not value:
             return None
@@ -219,8 +253,49 @@ class Grabber:
         multiplier = min(2 ** max(self._consecutive_network_errors - 1, 0), 8)
         return min(base * multiplier, self.config.network_backoff_max_ms / 1000.0)
 
+    # ---- AIMD 自适应限速 ----
+    def _aimd_floor(self) -> float:
+        return max(self._interval_seconds(), 0.05)
+
+    def _aimd_ceiling(self) -> float:
+        return max(self.config.max_interval_ms / 1000.0, self._aimd_floor())
+
+    def _on_rate_limit(self) -> None:
+        """收到限流信号（429/412）：乘性退避抬高动态间隔。"""
+
+        self.status.rate_limit_count += 1
+        self.status.consecutive_rate_limits += 1
+        if self.config.adaptive_rate_enabled:
+            self._dynamic_interval = min(self._dynamic_interval * 2.0, self._aimd_ceiling())
+        self.status.dynamic_interval_ms = int(round(self._dynamic_interval * 1000))
+
+    def _on_retryable(self) -> None:
+        """收到可重试（拥堵）响应：加性下调动态间隔，逐步逼近最优频率。"""
+
+        self.status.consecutive_rate_limits = 0
+        if self.config.adaptive_rate_enabled:
+            self._dynamic_interval = max(self._dynamic_interval - 0.05, self._aimd_floor())
+        self.status.dynamic_interval_ms = int(round(self._dynamic_interval * 1000))
+
+    def _retry_delay(self) -> float:
+        if not self.config.adaptive_rate_enabled:
+            return self._interval_seconds()
+        return self._dynamic_interval
+
+    def _reusable_token(self) -> str:
+        """返回可复用的 prepare token（仅拥堵重试且未过期），否则空串。"""
+
+        if not self._cached_token:
+            return ""
+        if time.perf_counter() - self._cached_token_at > _TOKEN_REUSE_SECONDS:
+            self._cached_token = ""
+            return ""
+        return self._cached_token
+
     def _rate_limit_retry_delay(self) -> float:
-        return max(self._interval_seconds(), self.config.rate_limit_backoff_ms / 1000.0)
+        self._on_rate_limit()
+        base = self._dynamic_interval if self.config.adaptive_rate_enabled else self._interval_seconds()
+        return max(base, self.config.rate_limit_backoff_ms / 1000.0)
 
     def _retry_result(self, reason: str, delay: float) -> AttemptResult:
         self.status.retry_reason = reason
@@ -257,6 +332,15 @@ class Grabber:
         )
         self._emit_status()
         await asyncio.sleep(result.retry_delay)
+
+    async def _sleep_continue_burst(self) -> None:
+        """库存不足但尚未达到回监控的冲刺轮数时，给一个自适应间隔再继续冲刺。"""
+
+        delay = self._retry_delay()
+        if delay <= 0:
+            return
+        self._emit(f"库存不足，继续冲刺（{int(round(delay * 1000))}ms 后重试）", "info")
+        await asyncio.sleep(delay)
 
     async def _wait_for_return_ticket(self, deadline: datetime) -> bool:
         assert self._client is not None
@@ -320,6 +404,10 @@ class Grabber:
         self.status = GrabberStatus(running=True)
         self._attempt_ms_total = 0
         self._consecutive_network_errors = 0
+        self._dynamic_interval = self._interval_seconds()
+        self.status.dynamic_interval_ms = int(round(self._dynamic_interval * 1000))
+        self._cached_token = ""
+        self._cached_token_at = 0.0
         self._emit_status()
         self._client = BiliClient(self.config.cookie)
         try:
@@ -344,9 +432,7 @@ class Grabber:
                 if self._now_for(deadline) >= deadline:
                     raise RuntimeError("监控截止时间已过期")
 
-            buyers, pay_money = await asyncio.gather(self._resolve_buyers(), self._resolve_price())
-            if pay_money <= 0:
-                raise RuntimeError("票价无效，请重新加载演出并选择票档")
+            buyers, pay_money = await self._resolve_prewarm_data()
             self._emit(f"购票人 {len(buyers)} 人，票价 {pay_money / 100:.2f} 元", "info")
 
             await self._wait_until_start(start_target)
@@ -363,12 +449,19 @@ class Grabber:
                     if not should_burst:
                         return
 
+                sold_out_in_burst = 0
                 while self.status.attempts < self.config.max_attempts:
                     result = await self._attempt_order(buyers, pay_money, extra_params)
                     if result.outcome is AttemptOutcome.STOP:
                         return
                     if result.outcome is AttemptOutcome.SOLD_OUT and self.config.return_monitor_enabled:
-                        break
+                        sold_out_in_burst += 1
+                        if sold_out_in_burst >= self.config.sold_out_burst_attempts:
+                            break
+                        if self.status.attempts < self.config.max_attempts:
+                            await self._sleep_continue_burst()
+                        continue
+                    sold_out_in_burst = 0
                     if self.status.attempts < self.config.max_attempts:
                         await self._sleep_before_retry(result)
 
@@ -403,30 +496,40 @@ class Grabber:
         self.status.retry_reason = ""
         self.status.retry_delay_ms = 0
 
-        try:
-            prepare_started_at = time.perf_counter()
-            prep = await ticket.prepare_order(
-                self._client,
-                self.config.project_id,
-                self.config.screen_id,
-                self.config.sku_id,
-                self.config.count,
-                buyers,
-            )
-            self.status.last_prepare_ms = self._elapsed_ms(prepare_started_at)
-        except Exception as exc:  # noqa: BLE001 网络抖动等
-            self.status.last_prepare_ms = self._elapsed_ms(prepare_started_at)
-            self.status.network_errors += 1
-            self._consecutive_network_errors += 1
-            self._record_attempt_timing(attempt_started_at)
-            self._emit(f"[{attempt}] prepare 异常: {exc}", "warn")
-            self._emit_status()
-            return self._retry_result("prepare 网络异常", self._network_retry_delay())
+        token = self._reusable_token()
+        if token:
+            self._emit(f"[{attempt}] 复用 prepare token，跳过预下单", "info")
+        else:
+            try:
+                prepare_started_at = time.perf_counter()
+                prep = await ticket.prepare_order(
+                    self._client,
+                    self.config.project_id,
+                    self.config.screen_id,
+                    self.config.sku_id,
+                    self.config.count,
+                    buyers,
+                )
+                self.status.last_prepare_ms = self._elapsed_ms(prepare_started_at)
+            except Exception as exc:  # noqa: BLE001 网络抖动等
+                self.status.last_prepare_ms = self._elapsed_ms(prepare_started_at)
+                self._cached_token = ""
+                self.status.network_errors += 1
+                self._consecutive_network_errors += 1
+                self._record_attempt_timing(attempt_started_at)
+                self._emit(f"[{attempt}] prepare 异常: {exc}", "warn")
+                self._emit_status()
+                return self._retry_result("prepare 网络异常", self._network_retry_delay())
 
-        if not prep.token:
-            self._consecutive_network_errors = 0
-            self._record_attempt_timing(attempt_started_at)
-            return await self._handle_prepare_failure(prep, attempt, extra_params)
+            if not prep.token:
+                self._cached_token = ""
+                self._consecutive_network_errors = 0
+                self._record_attempt_timing(attempt_started_at)
+                return await self._handle_prepare_failure(prep, attempt, extra_params)
+
+            token = prep.token
+            self._cached_token = token
+            self._cached_token_at = time.perf_counter()
 
         try:
             create_started_at = time.perf_counter()
@@ -436,7 +539,7 @@ class Grabber:
                 self.config.screen_id,
                 self.config.sku_id,
                 self.config.count,
-                prep.token,
+                token,
                 buyers,
                 pay_money,
                 extra_params=extra_params or None,
@@ -445,6 +548,7 @@ class Grabber:
             self._consecutive_network_errors = 0
         except Exception as exc:  # noqa: BLE001 网络抖动等
             self.status.last_create_ms = self._elapsed_ms(create_started_at)
+            self._cached_token = ""
             self.status.network_errors += 1
             self._consecutive_network_errors += 1
             self._record_attempt_timing(attempt_started_at)
@@ -453,6 +557,9 @@ class Grabber:
             return self._retry_result("create 网络异常", self._network_retry_delay())
 
         self._record_attempt_timing(attempt_started_at)
+
+        # 默认让 token 失效；仅在拥堵可重试时短时复用（见末尾分支）
+        self._cached_token = ""
 
         self.status.last_code = result.code
         self.status.last_message = result.message or describe(result.code)
@@ -489,13 +596,21 @@ class Grabber:
             return self._retry_result("风控处理失败", self._rate_limit_retry_delay())
 
         if self.config.return_monitor_enabled and kind is ResultKind.SOLD_OUT:
-            self._emit("下单时库存不足，回到回流票监控", "warn")
+            self.status.sold_out_count += 1
+            self._emit("下单时库存不足", "warn")
             return self._outcome_result(AttemptOutcome.SOLD_OUT)
+
+        if kind is ResultKind.SOLD_OUT:
+            self.status.sold_out_count += 1
+            return self._retry_result("库存不足/已售罄", self._retry_delay())
 
         if kind is ResultKind.RATE_LIMIT:
             return self._retry_result("请求过频/风控拦截", self._rate_limit_retry_delay())
 
-        return self._retry_result("接口返回可重试", self._interval_seconds())
+        self.status.congestion_count += 1
+        self._on_retryable()
+        self._cached_token = token  # 拥堵可重试，短时复用该 token
+        return self._retry_result("接口返回可重试", self._retry_delay())
 
     async def _handle_prepare_failure(
         self,
@@ -535,15 +650,18 @@ class Grabber:
             return self._retry_result("风控处理失败", self._rate_limit_retry_delay())
 
         if kind is ResultKind.SOLD_OUT:
+            self.status.sold_out_count += 1
             if self.config.return_monitor_enabled:
-                self._emit("预下单时库存不足，回到回流票监控", "warn")
+                self._emit("预下单时库存不足", "warn")
                 return self._outcome_result(AttemptOutcome.SOLD_OUT)
             return self._retry_result("库存不足/已售罄", self._interval_seconds())
 
         if kind is ResultKind.RATE_LIMIT:
             return self._retry_result("请求过频/风控拦截", self._rate_limit_retry_delay())
 
-        return self._retry_result("接口返回可重试", self._interval_seconds())
+        self.status.congestion_count += 1
+        self._on_retryable()
+        return self._retry_result("接口返回可重试", self._retry_delay())
 
     async def _handle_risk(self, v_voucher: str, extra_params: dict[str, Any]) -> bool:
         if not v_voucher:
@@ -586,3 +704,18 @@ def _has_pending_order(message: str, code: int | None = None) -> bool:
     """会员购在已锁单/待支付时可能只返回提示文案，而不是标准成功码。"""
 
     return code == 100048 or "尚未完成订单" in message or "待支付" in message
+
+
+# 预热解析时这些错误属于配置/校验问题，重试也不会变好，应立即中止
+_PERMANENT_RESOLVE_KEYWORDS = (
+    "未匹配",
+    "不能重复",
+    "必须与购买数量",
+    "票价无效",
+    "未发售",
+)
+
+
+def _is_permanent_resolve_error(exc: Exception) -> bool:
+    message = str(exc)
+    return any(keyword in message for keyword in _PERMANENT_RESOLVE_KEYWORDS)

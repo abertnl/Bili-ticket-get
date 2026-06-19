@@ -112,6 +112,9 @@ class ConfigUpdate(BaseModel):
     prewarm_seconds: int | None = Field(default=None, ge=0)
     rate_limit_backoff_ms: int | None = Field(default=None, ge=1000)
     network_backoff_max_ms: int | None = Field(default=None, ge=100)
+    adaptive_rate_enabled: bool | None = None
+    max_interval_ms: int | None = Field(default=None, ge=100)
+    sold_out_burst_attempts: int | None = Field(default=None, ge=1)
     return_monitor_enabled: bool | None = None
     monitor_interval_ms: int | None = Field(default=None, ge=1000)
     monitor_end_time: str | None = Field(default=None, max_length=64)
