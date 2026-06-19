@@ -93,10 +93,17 @@ class ServerConfigTests(unittest.TestCase):
         plain_client = TestClient(server.app)
         plain_client.cookies.set(server.ADMIN_COOKIE_NAME, "stale-token")
 
-        response = plain_client.get("/index.html")
+        response = plain_client.get("/")
+        index_response = plain_client.get("/index.html")
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("管理验证", response.text)
+        self.assertNotIn("/app.js", response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(index_response.status_code, 200)
+        self.assertIn("管理验证", index_response.text)
+        self.assertNotIn("/app.js", index_response.text)
+        self.assertEqual(index_response.headers["cache-control"], "no-store")
         self.assertNotIn("会员购抢票工具</h1>", response.text)
 
     def test_websocket_requires_admin_token(self) -> None:
@@ -411,6 +418,16 @@ class AuthQrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parse_qs(parsed.query)["from"], ["scan-web"])
         render_qr.assert_called_once_with(qr.url)
         self.assertEqual(qr.image_base64, "data:image/png;base64,test")
+
+
+class FrontendAuthFlowTests(unittest.TestCase):
+    def test_frontend_waits_for_config_before_opening_websocket(self) -> None:
+        source = (server.WEB_DIR / "app.js").read_text(encoding="utf-8")
+        init_start = source.index("(async function init()")
+        init_source = source[init_start:]
+
+        self.assertLess(init_source.index("await loadConfig();"), init_source.index("connectWS();"))
+        self.assertNotIn("ws.onclose = () => setTimeout(connectWS, 2000);", source)
 
 
 class ErrorClassificationTests(unittest.TestCase):

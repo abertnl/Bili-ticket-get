@@ -1,6 +1,13 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
+let authRedirecting = false;
+function redirectToAuth() {
+  if (authRedirecting) return;
+  authRedirecting = true;
+  location.replace("/");
+}
+
 const api = async (url, opts) => {
   const response = await fetch(url, opts);
   const text = await response.text();
@@ -17,7 +24,8 @@ const api = async (url, opts) => {
     data.status = response.status;
     data.message = data.message || data.detail || `请求失败：HTTP ${response.status}`;
     if (response.status === 401 && data.message.startsWith("未授权：")) {
-      location.replace("/");
+      redirectToAuth();
+      throw new Error(data.message);
     }
   }
   return data;
@@ -356,15 +364,29 @@ function applyStatus(s) {
 }
 
 let ws = null;
+let wsReconnectTimer = null;
 function connectWS() {
+  if (authRedirecting || ws) return;
+  let opened = false;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => {
+    opened = true;
+  };
   ws.onmessage = (e) => {
     const ev = JSON.parse(e.data);
     if (ev.type === "log") addLog(ev);
     else if (ev.type === "status") applyStatus(ev);
   };
-  ws.onclose = () => setTimeout(connectWS, 2000);
+  ws.onclose = (event) => {
+    ws = null;
+    if (authRedirecting || event.code === 1008 || !opened) {
+      redirectToAuth();
+      return;
+    }
+    if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = setTimeout(connectWS, 2000);
+  };
 }
 
 $("startBtn").addEventListener("click", async () => {
@@ -418,10 +440,10 @@ $("capSubmit").addEventListener("click", async () => {
 
 // ---------- 初始化 ----------
 (async function init() {
-  connectWS();
   try {
     await loadConfig();
     setUser(await api("/api/login/status"));
+    connectWS();
   } catch (e) {
     console.warn("初始化失败:", e);
   }

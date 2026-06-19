@@ -265,6 +265,7 @@ def _login_page() -> Response:
 </body>
 </html>""",
         media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -354,7 +355,10 @@ async def require_admin_token(request: Request, call_next):
             return _error("未授权：请提供管理 token", 401)
     elif not _request_authorized(request):
         return _login_page_with_cleared_cookie()
-    return await call_next(request)
+    response = await call_next(request)
+    if not request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 # ---- 页面 ----
