@@ -560,6 +560,28 @@ async def grab_status() -> dict[str, Any]:
     return state.grabber.status.to_dict()
 
 
+@app.get("/api/grab/report")
+async def grab_report() -> dict[str, Any]:
+    if not state.grabber:
+        return {
+            "run_id": "",
+            "phase": "idle",
+            "running": False,
+            "success": False,
+            "finished_reason": "",
+            "attempts": 0,
+            "monitor_checks": 0,
+            "effective_order_attempts": 0,
+            "rate_limit_count": 0,
+            "congestion_count": 0,
+            "sold_out_count": 0,
+            "network_errors": 0,
+            "telemetry_path": "",
+            "elapsed_ms": 0,
+        }
+    return state.grabber.report()
+
+
 # ---- 验证码（人工模式） ----
 @app.get("/api/captcha")
 async def captcha_pending() -> dict[str, Any]:

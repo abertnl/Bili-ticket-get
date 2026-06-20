@@ -7,9 +7,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
+import json
+from pathlib import Path
 import re
 import time
 from typing import Any
+from uuid import uuid4
 
 from . import notify
 from .bili import ticket
@@ -27,6 +30,41 @@ _TOKEN_REUSE_SECONDS = 2.5
 # 连续触发限流后进入更长冷却。短间隔会把同一账号/IP持续压在 429 窗口里。
 _RATE_LIMIT_COOLDOWN_AFTER = 3
 _RATE_LIMIT_COOLDOWN_MAX_SECONDS = 30.0
+_INITIAL_SOLD_OUT_BURST_ATTEMPTS = 3
+_RETURN_SOLD_OUT_BURST_ATTEMPTS = 3
+TELEMETRY_DIR = Path("runtime/grab-runs")
+
+
+class GrabPhase(str, Enum):
+    """自动平衡策略的运行阶段，用于调节节奏和复盘。"""
+
+    IDLE = "idle"
+    PREWARM = "prewarm"
+    START_WAIT = "start_wait"
+    START_BURST = "start_burst"
+    CONGESTION_RETRY = "congestion_retry"
+    RATE_LIMIT_COOLDOWN = "rate_limit_cooldown"
+    SOLD_OUT_MONITOR = "sold_out_monitor"
+    RETURN_BURST = "return_burst"
+    CAPTCHA = "captcha"
+    FINISHED = "finished"
+
+
+class BalancedStrategyController:
+    """单账号自动平衡策略：首发先短冲刺，回流阶段少撞限流。"""
+
+    def __init__(self) -> None:
+        self.phase = GrabPhase.IDLE
+
+    def set_phase(self, phase: GrabPhase) -> GrabPhase:
+        self.phase = phase
+        return phase
+
+    def initial_sold_out_limit(self) -> int:
+        return _INITIAL_SOLD_OUT_BURST_ATTEMPTS
+
+    def return_sold_out_limit(self, configured_limit: int) -> int:
+        return max(1, min(configured_limit, _RETURN_SOLD_OUT_BURST_ATTEMPTS))
 
 
 class AttemptOutcome(str, Enum):
@@ -72,6 +110,12 @@ class GrabberStatus:
     sold_out_count: int = 0
     consecutive_rate_limits: int = 0
     dynamic_interval_ms: int = 0
+    phase: str = GrabPhase.IDLE.value
+    run_id: str = ""
+    telemetry_path: str = ""
+    effective_delay_ms: int = 0
+    last_endpoint: str = ""
+    effective_order_attempts: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -86,6 +130,7 @@ class Grabber:
         self.status = GrabberStatus()
         self.solver = build_solver(config.captcha_mode, config.rrocr_token)
         self.risk = RiskHandler(self.solver)
+        self.strategy = BalancedStrategyController()
         self._task: asyncio.Task | None = None
         self._client: BiliClient | None = None
         self._attempt_ms_total = 0
@@ -93,6 +138,8 @@ class Grabber:
         self._dynamic_interval = self._interval_seconds()
         self._cached_token = ""
         self._cached_token_at = 0.0
+        self._telemetry_path: Path | None = None
+        self._run_started_at = 0.0
 
     # ---- 日志 ----
     def _emit(self, message: str, level: str = "info", **extra: Any) -> None:
@@ -107,6 +154,77 @@ class Grabber:
 
     def _emit_status(self) -> None:
         self.on_event({"type": "status", **self.status.to_dict()})
+
+    def _set_phase(self, phase: GrabPhase) -> None:
+        self.status.phase = self.strategy.set_phase(phase).value
+
+    def _start_telemetry(self) -> None:
+        run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
+        self.status.run_id = run_id
+        self._telemetry_path = TELEMETRY_DIR / f"{run_id}.jsonl"
+        self.status.telemetry_path = str(self._telemetry_path)
+        self._run_started_at = time.perf_counter()
+        self._record_telemetry("run_start", outcome="running")
+
+    def _record_telemetry(
+        self,
+        event: str,
+        *,
+        endpoint: str = "",
+        attempt: int | None = None,
+        code: int | None = None,
+        kind: str = "",
+        delay_ms: int | None = None,
+        elapsed_ms: int | None = None,
+        stock_status: str = "",
+        outcome: str = "",
+    ) -> None:
+        if not self._telemetry_path:
+            return
+        payload: dict[str, Any] = {
+            "run_id": self.status.run_id,
+            "time": datetime.now().isoformat(timespec="milliseconds"),
+            "event": event,
+            "phase": self.status.phase,
+            "endpoint": endpoint,
+            "attempt": attempt,
+            "code": code,
+            "kind": kind,
+            "delay_ms": delay_ms,
+            "elapsed_ms": elapsed_ms,
+            "dynamic_interval_ms": self.status.dynamic_interval_ms,
+            "consecutive_rate_limits": self.status.consecutive_rate_limits,
+            "stock_status": stock_status,
+            "outcome": outcome,
+        }
+        try:
+            self._telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._telemetry_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except OSError:
+            # 抢票流程优先，复盘文件写入失败不应中断下单。
+            return
+
+    def report(self) -> dict[str, Any]:
+        elapsed_ms = 0
+        if self._run_started_at:
+            elapsed_ms = int(round((time.perf_counter() - self._run_started_at) * 1000))
+        return {
+            "run_id": self.status.run_id,
+            "phase": self.status.phase,
+            "running": self.status.running,
+            "success": self.status.success,
+            "finished_reason": self.status.finished_reason,
+            "attempts": self.status.attempts,
+            "monitor_checks": self.status.monitor_checks,
+            "effective_order_attempts": self.status.effective_order_attempts,
+            "rate_limit_count": self.status.rate_limit_count,
+            "congestion_count": self.status.congestion_count,
+            "sold_out_count": self.status.sold_out_count,
+            "network_errors": self.status.network_errors,
+            "telemetry_path": self.status.telemetry_path,
+            "elapsed_ms": elapsed_ms,
+        }
 
     # ---- 人工验证码交互（供 server 调用） ----
     def captcha_pending(self) -> dict[str, str] | None:
@@ -144,6 +262,7 @@ class Grabber:
     async def _wait_until_prewarm(self, target: datetime | None) -> None:
         if target is None:
             return
+        self._set_phase(GrabPhase.PREWARM)
         prewarm_at = target - timedelta(seconds=self.config.prewarm_seconds)
         while True:
             now = self._now_for(target)
@@ -159,6 +278,7 @@ class Grabber:
             target = self._parse_local_time(self.config.start_time, "开抢时间")
         if target is None:
             return
+        self._set_phase(GrabPhase.START_WAIT)
         last_logged_second: int | None = None
         while True:
             now = self._now_for(target)
@@ -333,6 +453,15 @@ class Grabber:
     async def _sleep_before_retry(self, result: AttemptResult) -> None:
         if result.retry_delay <= 0:
             return
+        self.status.effective_delay_ms = self.status.retry_delay_ms
+        self._record_telemetry(
+            "retry_sleep",
+            endpoint=self.status.last_endpoint,
+            attempt=self.status.attempts,
+            code=self.status.last_code,
+            delay_ms=self.status.retry_delay_ms,
+            outcome=result.retry_reason,
+        )
         self._emit(
             f"等待 {self.status.retry_delay_ms}ms 后重试（{result.retry_reason}）",
             "info",
@@ -348,11 +477,22 @@ class Grabber:
         delay = self._retry_delay()
         if delay <= 0:
             return
-        self._emit(f"库存不足，继续冲刺（{int(round(delay * 1000))}ms 后重试）", "info")
+        delay_ms = int(round(delay * 1000))
+        self.status.effective_delay_ms = delay_ms
+        self._record_telemetry(
+            "retry_sleep",
+            endpoint=self.status.last_endpoint,
+            attempt=self.status.attempts,
+            code=self.status.last_code,
+            delay_ms=delay_ms,
+            outcome="库存不足继续冲刺",
+        )
+        self._emit(f"库存不足，继续冲刺（{delay_ms}ms 后重试）", "info")
         await asyncio.sleep(delay)
 
     async def _wait_for_return_ticket(self, deadline: datetime) -> bool:
         assert self._client is not None
+        self._set_phase(GrabPhase.SOLD_OUT_MONITOR)
         interval = self.config.monitor_interval_ms / 1000.0
         while True:
             remaining = (deadline - self._now_for(deadline)).total_seconds()
@@ -362,6 +502,7 @@ class Grabber:
                 return False
 
             self.status.monitor_checks += 1
+            self.status.last_endpoint = "project"
             try:
                 project = await ticket.get_project(self._client, self.config.project_id)
                 sku = self._find_target_sku(project)
@@ -369,20 +510,38 @@ class Grabber:
                 rate_limit_code = _rate_limit_code_from_exception(exc)
                 delay = min(interval, remaining)
                 if rate_limit_code is not None:
+                    self._set_phase(GrabPhase.RATE_LIMIT_COOLDOWN)
                     self.status.last_code = rate_limit_code
                     self.status.last_message = f"HTTP {rate_limit_code}"
                     delay = min(max(interval, self._rate_limit_retry_delay()), remaining)
                     self.status.retry_reason = "监控请求过频/风控拦截"
                     self.status.retry_delay_ms = int(round(delay * 1000))
+                self.status.effective_delay_ms = int(round(delay * 1000))
                 self.status.last_stock_status = f"监控异常: {exc}"
+                self._record_telemetry(
+                    "monitor_check",
+                    endpoint="project",
+                    code=rate_limit_code,
+                    delay_ms=self.status.effective_delay_ms,
+                    stock_status=self.status.last_stock_status,
+                    outcome="error",
+                )
                 self._emit(f"[监控 {self.status.monitor_checks}] 获取票档失败: {exc}", "warn")
                 self._emit_status()
                 await asyncio.sleep(delay)
+                self._set_phase(GrabPhase.SOLD_OUT_MONITOR)
                 continue
 
             if self.status.retry_reason == "监控请求过频/风控拦截":
                 self._clear_retry_status()
             self.status.last_stock_status = self._format_stock_status(sku)
+            self._record_telemetry(
+                "monitor_check",
+                endpoint="project",
+                code=0,
+                stock_status=self.status.last_stock_status,
+                outcome="available" if self._sku_looks_available(sku) else "unavailable",
+            )
             self._emit(
                 f"[监控 {self.status.monitor_checks}] {self.status.last_stock_status}",
                 "info",
@@ -421,12 +580,15 @@ class Grabber:
 
     async def _run(self) -> None:
         self.status = GrabberStatus(running=True)
+        self.strategy = BalancedStrategyController()
         self._attempt_ms_total = 0
         self._consecutive_network_errors = 0
         self._dynamic_interval = self._interval_seconds()
         self.status.dynamic_interval_ms = int(round(self._dynamic_interval * 1000))
         self._cached_token = ""
         self._cached_token_at = 0.0
+        self._telemetry_path = None
+        self._start_telemetry()
         self._emit_status()
         self._client = BiliClient(self.config.cookie)
         try:
@@ -436,6 +598,7 @@ class Grabber:
                 return
 
             start_target = self._parse_local_time(self.config.start_time, "开抢时间")
+            self._set_phase(GrabPhase.PREWARM)
             await self._wait_until_prewarm(start_target)
             self._emit("开始抢票预热", "info")
             if await self._client.gen_bili_ticket():
@@ -455,18 +618,32 @@ class Grabber:
             self._emit(f"购票人 {len(buyers)} 人，票价 {pay_money / 100:.2f} 元", "info")
 
             await self._wait_until_start(start_target)
+            self._set_phase(GrabPhase.START_BURST)
             self._emit("开始抢票", "info")
             if self.config.return_monitor_enabled:
                 self._emit("开始回流票监控", "info")
 
             extra_params: dict[str, Any] = {}
+            initial_burst_pending = self.config.return_monitor_enabled
 
             while self.status.attempts < self.config.max_attempts:
                 if self.config.return_monitor_enabled:
-                    assert deadline is not None
-                    should_burst = await self._wait_for_return_ticket(deadline)
-                    if not should_burst:
-                        return
+                    if initial_burst_pending:
+                        initial_burst_pending = False
+                        self._set_phase(GrabPhase.START_BURST)
+                        sold_out_burst_limit = self.strategy.initial_sold_out_limit()
+                    else:
+                        assert deadline is not None
+                        should_burst = await self._wait_for_return_ticket(deadline)
+                        if not should_burst:
+                            return
+                        self._set_phase(GrabPhase.RETURN_BURST)
+                        sold_out_burst_limit = self.strategy.return_sold_out_limit(
+                            self.config.sold_out_burst_attempts
+                        )
+                else:
+                    self._set_phase(GrabPhase.START_BURST)
+                    sold_out_burst_limit = self.config.sold_out_burst_attempts
 
                 sold_out_in_burst = 0
                 while self.status.attempts < self.config.max_attempts:
@@ -475,7 +652,7 @@ class Grabber:
                         return
                     if result.outcome is AttemptOutcome.SOLD_OUT and self.config.return_monitor_enabled:
                         sold_out_in_burst += 1
-                        if sold_out_in_burst >= self.config.sold_out_burst_attempts:
+                        if sold_out_in_burst >= sold_out_burst_limit:
                             break
                         if self.status.attempts < self.config.max_attempts:
                             await self._sleep_continue_burst()
@@ -495,6 +672,8 @@ class Grabber:
             self.status.finished_reason = str(exc)
         finally:
             self.status.running = False
+            self._set_phase(GrabPhase.FINISHED)
+            self._record_telemetry("run_finish", outcome=self.status.finished_reason or "finished")
             self._emit_status()
             if self._client:
                 await self._client.aclose()
@@ -514,12 +693,14 @@ class Grabber:
         self.status.last_create_ms = 0
         self.status.retry_reason = ""
         self.status.retry_delay_ms = 0
+        self.status.effective_delay_ms = 0
 
         token = self._reusable_token()
         if token:
             self._emit(f"[{attempt}] 复用 prepare token，跳过预下单", "info")
         else:
             try:
+                self.status.last_endpoint = "prepare"
                 prepare_started_at = time.perf_counter()
                 prep = await ticket.prepare_order(
                     self._client,
@@ -530,12 +711,29 @@ class Grabber:
                     buyers,
                 )
                 self.status.last_prepare_ms = self._elapsed_ms(prepare_started_at)
+                self._record_telemetry(
+                    "prepare_result",
+                    endpoint="prepare",
+                    attempt=attempt,
+                    code=prep.code,
+                    kind=classify(prep.code).value,
+                    elapsed_ms=self.status.last_prepare_ms,
+                    outcome="token" if prep.token else "no_token",
+                )
             except Exception as exc:  # noqa: BLE001 网络抖动等
                 self.status.last_prepare_ms = self._elapsed_ms(prepare_started_at)
                 self._cached_token = ""
                 self.status.network_errors += 1
                 self._consecutive_network_errors += 1
                 self._record_attempt_timing(attempt_started_at)
+                self.status.last_endpoint = "prepare"
+                self._record_telemetry(
+                    "attempt_result",
+                    endpoint="prepare",
+                    attempt=attempt,
+                    elapsed_ms=self.status.last_prepare_ms,
+                    outcome="network_error",
+                )
                 self._emit(f"[{attempt}] prepare 异常: {exc}", "warn")
                 self._emit_status()
                 return self._retry_result("prepare 网络异常", self._network_retry_delay())
@@ -551,6 +749,8 @@ class Grabber:
             self._cached_token_at = time.perf_counter()
 
         try:
+            self.status.last_endpoint = "create"
+            self.status.effective_order_attempts += 1
             create_started_at = time.perf_counter()
             result = await ticket.create_order(
                 self._client,
@@ -571,6 +771,14 @@ class Grabber:
             self.status.network_errors += 1
             self._consecutive_network_errors += 1
             self._record_attempt_timing(attempt_started_at)
+            self.status.last_endpoint = "create"
+            self._record_telemetry(
+                "attempt_result",
+                endpoint="create",
+                attempt=attempt,
+                elapsed_ms=self.status.last_create_ms,
+                outcome="network_error",
+            )
             self._emit(f"[{attempt}] create 异常: {exc}", "warn")
             self._emit_status()
             return self._retry_result("create 网络异常", self._network_retry_delay())
@@ -583,6 +791,15 @@ class Grabber:
         self.status.last_code = result.code
         self.status.last_message = result.message or describe(result.code)
         kind = classify(result.code)
+        self._record_telemetry(
+            "attempt_result",
+            endpoint="create",
+            attempt=attempt,
+            code=result.code,
+            kind=kind.value,
+            elapsed_ms=self.status.last_attempt_ms,
+            outcome=result.message or describe(result.code),
+        )
         self._emit(
             f"[{attempt}] code={result.code} {self.status.last_message}",
             "info",
@@ -624,9 +841,11 @@ class Grabber:
             return self._retry_result("库存不足/已售罄", self._retry_delay())
 
         if kind is ResultKind.RATE_LIMIT:
+            self._set_phase(GrabPhase.RATE_LIMIT_COOLDOWN)
             return self._retry_result("请求过频/风控拦截", self._rate_limit_retry_delay())
 
         self.status.congestion_count += 1
+        self._set_phase(GrabPhase.CONGESTION_RETRY)
         self._on_retryable()
         self._cached_token = token  # 拥堵可重试，短时复用该 token
         return self._retry_result("接口返回可重试", self._retry_delay())
@@ -676,9 +895,11 @@ class Grabber:
             return self._retry_result("库存不足/已售罄", self._interval_seconds())
 
         if kind is ResultKind.RATE_LIMIT:
+            self._set_phase(GrabPhase.RATE_LIMIT_COOLDOWN)
             return self._retry_result("请求过频/风控拦截", self._rate_limit_retry_delay())
 
         self.status.congestion_count += 1
+        self._set_phase(GrabPhase.CONGESTION_RETRY)
         self._on_retryable()
         return self._retry_result("接口返回可重试", self._retry_delay())
 
@@ -687,6 +908,7 @@ class Grabber:
             self._emit("触发风控但未获得 v_voucher，稍后重试", "warn")
             return False
         self._emit("触发风控，开始人机验证…", "warn")
+        self._set_phase(GrabPhase.CAPTCHA)
         self.status.waiting_captcha = True
         self._emit_status()
         try:

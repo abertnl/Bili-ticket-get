@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -337,6 +339,13 @@ class ServerConfigTests(unittest.TestCase):
         self.assertEqual(response.json()["ok"], False)
         self.assertIn("监控截止时间格式无效", response.json()["message"])
         self.assertIsNone(server.state.grabber)
+
+    def test_grab_report_returns_empty_summary_without_run(self) -> None:
+        response = self.client.get("/api/grab/report")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["run_id"], "")
+        self.assertEqual(response.json()["effective_order_attempts"], 0)
 
 
 class NotifyTests(unittest.IsolatedAsyncioTestCase):
@@ -1087,6 +1096,56 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["title"], "会员购订单待支付")
         self.assertEqual(kwargs["body"], "订单 ORDER123 已生成，请在 10 分钟内支付")
 
+    async def test_run_writes_sanitized_telemetry_and_report_summary(self) -> None:
+        events: list[dict] = []
+        config = self.make_config()
+        config.max_attempts = 1
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="15555550123", id_card="secret-id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                )
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            grabber = Grabber(config, on_event=events.append)
+            with (
+                patch("app.grabber.TELEMETRY_DIR", Path(tmp)),
+                patch("app.grabber.BiliClient", FakeBiliClient),
+                patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+                patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+                patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
+                patch(
+                    "app.grabber.ticket.create_order",
+                    new=AsyncMock(return_value=ticket.CreateResult(code=100009, message="库存不足")),
+                ),
+            ):
+                await grabber._run()
+
+            telemetry_path = Path(grabber.status.telemetry_path)
+            self.assertTrue(grabber.status.run_id)
+            self.assertEqual(grabber.status.phase, "finished")
+            self.assertTrue(telemetry_path.exists())
+            payloads = [json.loads(line) for line in telemetry_path.read_text(encoding="utf-8").splitlines()]
+            self.assertTrue(any(item["event"] == "attempt_result" for item in payloads))
+            telemetry_text = telemetry_path.read_text(encoding="utf-8")
+            self.assertNotIn("SESSDATA", telemetry_text)
+            self.assertNotIn("Alice", telemetry_text)
+            self.assertNotIn("15555550123", telemetry_text)
+            self.assertNotIn("secret-id", telemetry_text)
+
+            report = grabber.report()
+            self.assertEqual(report["run_id"], grabber.status.run_id)
+            self.assertEqual(report["telemetry_path"], str(telemetry_path))
+            self.assertEqual(report["effective_order_attempts"], 1)
+            self.assertEqual(report["sold_out_count"], 1)
+
     def test_return_monitor_stock_detection_uses_count_and_sale_flag(self) -> None:
         grabber = Grabber(self.make_config())
 
@@ -1107,9 +1166,10 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(grabber.status.running)
         self.assertIn("监控截止时间已过期", grabber.status.finished_reason)
 
-    async def test_return_monitor_waits_without_prepare_when_no_stock(self) -> None:
+    async def test_return_monitor_stops_without_extra_prepare_when_no_stock_after_initial_burst(self) -> None:
         config = self.make_config()
         config.return_monitor_enabled = True
+        config.max_attempts = 4
         config.monitor_end_time = self.future_time()
         grabber = Grabber(config)
         buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
@@ -1129,17 +1189,24 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
             patch("app.grabber.BiliClient", FakeBiliClient),
             patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
             patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
-            patch("app.grabber.Grabber._wait_for_return_ticket", new=AsyncMock(return_value=False)),
-            patch("app.grabber.ticket.prepare_order", new=AsyncMock()) as prepare_order,
+            patch("app.grabber.Grabber._wait_for_return_ticket", new=AsyncMock(return_value=False)) as wait_for_return,
+            patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())) as prepare_order,
+            patch(
+                "app.grabber.ticket.create_order",
+                new=AsyncMock(return_value=ticket.CreateResult(code=100009, message="库存不足")),
+            ),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()),
         ):
             await grabber._run()
 
-        prepare_order.assert_not_awaited()
+        self.assertEqual(prepare_order.await_count, 3)
+        wait_for_return.assert_awaited_once()
 
     async def test_sold_out_after_return_monitor_goes_back_to_monitoring(self) -> None:
         config = self.make_config()
         config.return_monitor_enabled = True
         config.sold_out_burst_attempts = 1
+        config.max_attempts = 5
         config.monitor_end_time = self.future_time()
         grabber = Grabber(config)
         buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
@@ -1173,7 +1240,44 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
             await grabber._run()
 
         self.assertEqual(wait_for_return.await_count, 2)
-        create_order.assert_awaited_once()
+        self.assertEqual(create_order.await_count, 4)
+
+    async def test_return_monitor_runs_initial_burst_before_monitoring(self) -> None:
+        config = self.make_config()
+        config.return_monitor_enabled = True
+        config.sold_out_burst_attempts = 6
+        config.max_attempts = 10
+        config.monitor_end_time = self.future_time()
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "销售中", 1)],
+                )
+            ],
+        )
+        wait_for_return = AsyncMock(return_value=False)
+        create_order = AsyncMock(return_value=ticket.CreateResult(code=100009, message="库存不足"))
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch("app.grabber.Grabber._wait_for_return_ticket", new=wait_for_return),
+            patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
+            patch("app.grabber.ticket.create_order", new=create_order),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()),
+        ):
+            await grabber._run()
+
+        self.assertEqual(create_order.await_count, 3)
+        wait_for_return.assert_awaited_once()
+        self.assertEqual(grabber.status.sold_out_count, 3)
 
     def test_aimd_backs_off_on_rate_limit_and_speeds_up_on_retry(self) -> None:
         config = self.make_config()
@@ -1244,9 +1348,9 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         ):
             await grabber._run()
 
-        self.assertEqual(create_order.await_count, 3)
+        self.assertEqual(create_order.await_count, 6)
         self.assertEqual(wait_for_return.await_count, 2)
-        self.assertEqual(grabber.status.sold_out_count, 3)
+        self.assertEqual(grabber.status.sold_out_count, 6)
 
     async def test_prewarm_resolution_retries_transient_failure(self) -> None:
         config = self.make_config()

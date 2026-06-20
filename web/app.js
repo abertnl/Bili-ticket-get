@@ -363,6 +363,10 @@ function applyStatus(s) {
   $("statNetworkErrors").textContent = s.network_errors ?? 0;
   $("statRateLimit").textContent = s.rate_limit_count ?? 0;
   $("statDynamicInterval").textContent = `${s.dynamic_interval_ms ?? 0}ms`;
+  $("statEffectiveOrders").textContent = s.effective_order_attempts ?? 0;
+  $("statPhase").textContent = s.phase || "idle";
+  $("statTelemetryPath").textContent = s.telemetry_path || "-";
+  $("statTelemetryPath").title = s.telemetry_path || "";
   $("retryInfo").textContent = s.running && s.retry_reason
     ? `下次重试：${s.retry_reason} · 等待 ${s.retry_delay_ms ?? 0}ms`
     : "";
