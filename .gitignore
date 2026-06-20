@@ -12,6 +12,7 @@ wheels/
 
 # 本地配置（包含登录 Cookie，请勿提交）
 config.json
+runtime/
 
 # Local/editor metadata
 *:Zone.Identifier

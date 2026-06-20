@@ -105,6 +105,11 @@
             <input type="number" id="rateLimitBackoffInput" min="1000" value="2000" />
           </div>
           <div class="row">
+            <label>连续限流冷却(ms)</label>
+            <input type="number" id="rateLimitCooldownInput" min="1000" value="8000" />
+            <p class="field-hint">连续 429/412 时进入更长冷却，避免一直卡在限流窗口。</p>
+          </div>
+          <div class="row">
             <label>网络退避上限(ms)</label>
             <input type="number" id="networkBackoffMaxInput" min="100" value="3000" />
           </div>
@@ -161,6 +166,9 @@
             <div class="stat"><span class="num" id="statNetworkErrors">0</span><span class="lbl">网络异常</span></div>
             <div class="stat"><span class="num" id="statRateLimit">0</span><span class="lbl">限流次数</span></div>
             <div class="stat"><span class="num" id="statDynamicInterval">0ms</span><span class="lbl">当前间隔</span></div>
+            <div class="stat"><span class="num" id="statEffectiveOrders">0</span><span class="lbl">有效下单</span></div>
+            <div class="stat"><span class="num" id="statPhase">idle</span><span class="lbl">策略阶段</span></div>
+            <div class="stat stat-wide"><span class="num path" id="statTelemetryPath">-</span><span class="lbl">复盘文件</span></div>
           </div>
           <div class="controls">
             <button class="btn" id="startBtn">保存并开始抢票</button>

@@ -9,8 +9,10 @@ Bilibili 会员购（show.bilibili.com）本地抢票工具。基于 FastAPI 的
 - **扫码 / Cookie 登录** — 支持 B 站 App 扫码登录或手动粘贴 Cookie
 - **定时开抢** — 精确到秒的开抢时间设定，支持提前预热凭据
 - **自动重试** — 可配置请求间隔、最大尝试次数、限流退避策略
+- **自动平衡策略** — 首发短冲刺、回流低频监控、连续限流冷却，减少无效请求
 - **风控处理** — 自动识别 `-352` 风控，支持人工极验回填和第三方打码（rrocr）
 - **回流票监控** — 售罄后低频监控票档状态，发现回流自动下单冲刺
+- **本地复盘** — 每次运行生成 JSONL 事件文件，便于复盘限流、拥堵和售罄节奏
 - **实时日志** — WebSocket 推送抢票过程中的每一步日志
 - **抢中推送** — 支持 Bark、Server 酱、macOS iMessage 通知
 - **Web 界面** — 全中文操作界面，浏览器打开即用
@@ -62,10 +64,14 @@ uv run main.py
 | `max_attempts` | 最大尝试次数 | `300` |
 | `prewarm_seconds` | 开抢前预热提前量（秒） | `30` |
 | `rate_limit_backoff_ms` | 限流退避（毫秒） | `2000` |
+| `rate_limit_cooldown_ms` | 连续限流冷却（毫秒） | `8000` |
 | `captcha_mode` | 验证码方式：`manual` / `rrocr` | `manual` |
 | `return_monitor_enabled` | 启用回流票监控 | `false` |
 | `notify.bark_url` | Bark 推送地址 | `""` |
 | `notify.serverchan_key` | Server 酱 Key | `""` |
+
+启用回流票监控时，默认策略会在开抢点先短冲刺，再进入低频回流监控；发现疑似可售后重新进入下单冲刺。
+每次运行会在 `runtime/grab-runs/` 下写入一份 JSONL 复盘文件，该目录已被 git 忽略。
 
 ## 项目结构
 
@@ -103,7 +109,7 @@ uv run main.py
 
 | 现象 | 解决方法 |
 |------|----------|
-| 一直返回 `429` | 增大 `interval_ms`，建议 1000ms 以上 |
+| 一直返回 `429` | 增大 `interval_ms`，并把 `rate_limit_cooldown_ms` 调到 8000ms 以上 |
 | 触发 `-352` 风控 | 按页面提示完成人机验证，适当降低频率 |
 | 加载购票人失败 | 重新登录，确认账号已添加实名购票人 |
 | 售罄 (`100009`) | 启用回流票监控，等待退票释放库存 |

@@ -112,6 +112,7 @@ class AppConfig(BaseModel):
     max_attempts: int = Field(default=300, ge=1, description="最大尝试次数")
     prewarm_seconds: int = Field(default=30, ge=0, description="开抢前多少秒执行购票人/票价等预热")
     rate_limit_backoff_ms: int = Field(default=2000, ge=1000, description="遇到 429/412 等限流响应时的最小退避（毫秒）")
+    rate_limit_cooldown_ms: int = Field(default=8000, ge=1000, description="连续遇到 429/412 后进入冷却的基础等待（毫秒）")
     network_backoff_max_ms: int = Field(default=3000, ge=100, description="网络异常指数退避的最大等待（毫秒）")
     adaptive_rate_enabled: bool = Field(default=True, description="启用 AIMD 自适应限速：遇 429/412 退避，顺畅时逐步加速")
     max_interval_ms: int = Field(default=3000, ge=100, description="自适应限速的间隔上限（毫秒），interval_ms 为下限")

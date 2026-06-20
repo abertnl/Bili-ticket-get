@@ -276,6 +276,7 @@ function collectConfig() {
     max_attempts: parseInt($("maxAttemptsInput").value || "300", 10),
     prewarm_seconds: parseInt($("prewarmSecondsInput").value || "30", 10),
     rate_limit_backoff_ms: parseInt($("rateLimitBackoffInput").value || "2000", 10),
+    rate_limit_cooldown_ms: parseInt($("rateLimitCooldownInput").value || "8000", 10),
     network_backoff_max_ms: parseInt($("networkBackoffMaxInput").value || "3000", 10),
     adaptive_rate_enabled: $("adaptiveRateEnabled").checked,
     max_interval_ms: parseInt($("maxIntervalInput").value || "3000", 10),
@@ -320,6 +321,7 @@ async function loadConfig() {
   $("maxAttemptsInput").value = c.max_attempts || 300;
   $("prewarmSecondsInput").value = c.prewarm_seconds ?? 30;
   $("rateLimitBackoffInput").value = c.rate_limit_backoff_ms ?? 2000;
+  $("rateLimitCooldownInput").value = c.rate_limit_cooldown_ms ?? 8000;
   $("networkBackoffMaxInput").value = c.network_backoff_max_ms ?? 3000;
   $("adaptiveRateEnabled").checked = c.adaptive_rate_enabled ?? true;
   $("maxIntervalInput").value = c.max_interval_ms ?? 3000;
@@ -361,6 +363,10 @@ function applyStatus(s) {
   $("statNetworkErrors").textContent = s.network_errors ?? 0;
   $("statRateLimit").textContent = s.rate_limit_count ?? 0;
   $("statDynamicInterval").textContent = `${s.dynamic_interval_ms ?? 0}ms`;
+  $("statEffectiveOrders").textContent = s.effective_order_attempts ?? 0;
+  $("statPhase").textContent = s.phase || "idle";
+  $("statTelemetryPath").textContent = s.telemetry_path || "-";
+  $("statTelemetryPath").title = s.telemetry_path || "";
   $("retryInfo").textContent = s.running && s.retry_reason
     ? `下次重试：${s.retry_reason} · 等待 ${s.retry_delay_ms ?? 0}ms`
     : "";
