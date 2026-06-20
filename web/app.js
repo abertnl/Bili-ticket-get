@@ -362,9 +362,14 @@ function applyStatus(s) {
   $("statAvgAttemptMs").textContent = `${s.avg_attempt_ms ?? 0}ms`;
   $("statNetworkErrors").textContent = s.network_errors ?? 0;
   $("statRateLimit").textContent = s.rate_limit_count ?? 0;
+  $("statCongestion").textContent = s.congestion_count ?? 0;
+  $("statSoldOut").textContent = s.sold_out_count ?? 0;
   $("statDynamicInterval").textContent = `${s.dynamic_interval_ms ?? 0}ms`;
   $("statEffectiveOrders").textContent = s.effective_order_attempts ?? 0;
   $("statPhase").textContent = s.phase || "idle";
+  $("statTimeOffset").textContent = `${s.time_offset_ms ?? 0}ms`;
+  $("statPrewarm").textContent = s.prewarm_ok ? "成功" : "-";
+  $("statTransport").textContent = s.transport || "-";
   $("statTelemetryPath").textContent = s.telemetry_path || "-";
   $("statTelemetryPath").title = s.telemetry_path || "";
   $("retryInfo").textContent = s.running && s.retry_reason
@@ -374,6 +379,17 @@ function applyStatus(s) {
   $("lastMsg").textContent = detail;
   $("statState").classList.toggle("success", !!s.success);
   $("lastMsg").classList.toggle("success", !!s.success);
+  const hasPayment = !!s.payment_url;
+  $("paymentBox").classList.toggle("hidden", !hasPayment);
+  $("orderIdText").textContent = s.order_id ? `订单 ${s.order_id}` : "";
+  if (hasPayment) {
+    $("paymentUrl").href = s.payment_url;
+  }
+  const hasQr = !!s.pay_qrcode_url;
+  $("payQrUrl").classList.toggle("hidden", !hasQr);
+  if (hasQr) {
+    $("payQrUrl").href = s.pay_qrcode_url;
+  }
   if (s.waiting_captcha) checkCaptcha();
 }
 

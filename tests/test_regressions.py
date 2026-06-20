@@ -4,7 +4,8 @@ import importlib.util
 import json
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import AsyncMock, patch
@@ -346,6 +347,9 @@ class ServerConfigTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["run_id"], "")
         self.assertEqual(response.json()["effective_order_attempts"], 0)
+        self.assertEqual(response.json()["payment_url"], "")
+        self.assertEqual(response.json()["time_offset_ms"], 0)
+        self.assertEqual(response.json()["transport"], "")
 
 
 class NotifyTests(unittest.IsolatedAsyncioTestCase):
@@ -476,18 +480,33 @@ class ErrorClassificationTests(unittest.TestCase):
     def test_rate_limit_codes_are_distinct_from_regular_retry(self) -> None:
         self.assertIs(classify(429), ResultKind.RATE_LIMIT)
         self.assertIs(classify(412), ResultKind.RATE_LIMIT)
+        self.assertIs(classify(3), ResultKind.RATE_LIMIT)
+        self.assertIs(classify(221), ResultKind.RATE_LIMIT)
+        self.assertIs(classify(900002), ResultKind.RATE_LIMIT)
         self.assertIs(classify(100001), ResultKind.RETRY)
 
     def test_congestion_codes_are_retryable(self) -> None:
         self.assertIs(classify(900001), ResultKind.RETRY)
         self.assertIs(classify(100039), ResultKind.RETRY)
 
+    def test_new_risk_and_terminal_codes_are_classified(self) -> None:
+        self.assertIs(classify(100044), ResultKind.RISK)
+        self.assertIs(classify(100016), ResultKind.FATAL)
+
 
 class FakeBiliClient:
     is_logged_in = True
+    transport = "http1"
 
-    def __init__(self, cookie: str) -> None:
+    def __init__(self, cookie: str, **kwargs) -> None:
         self.cookie = cookie
+        self.kwargs = kwargs
+
+    async def sync_server_time(self) -> int:
+        return 0
+
+    async def prewarm_connection(self) -> bool:
+        return True
 
     async def gen_bili_ticket(self) -> str:
         return "ticket"
@@ -496,8 +515,8 @@ class FakeBiliClient:
         return None
 
 
-def ok_prepare(token: str = "token") -> ticket.PrepareResult:
-    return ticket.PrepareResult(code=0, message="", token=token)
+def ok_prepare(token: str = "token", ptoken: str = "") -> ticket.PrepareResult:
+    return ticket.PrepareResult(code=0, message="", token=token, ptoken=ptoken)
 
 
 class GrabberTests(unittest.IsolatedAsyncioTestCase):
@@ -519,6 +538,8 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
     def test_has_pending_order_matches_known_payment_messages(self) -> None:
         self.assertTrue(_has_pending_order("你有尚未完成订单，请先支付"))
         self.assertTrue(_has_pending_order("存在待支付订单"))
+        self.assertTrue(_has_pending_order("重复购买", 100003))
+        self.assertTrue(_has_pending_order("重复订单", 100079))
         self.assertFalse(_has_pending_order("库存不足"))
 
     async def test_invalid_price_stops_before_prepare(self) -> None:
@@ -1085,16 +1106,20 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ),
             ),
+            patch("app.grabber.ticket.get_pay_qrcode_url", new=AsyncMock(return_value="https://pay.example/qr")),
             patch("app.grabber.notify.send_all", new=AsyncMock()) as send_all,
         ):
             await grabber._run()
 
         self.assertTrue(grabber.status.success)
         self.assertEqual(grabber.status.order_id, "ORDER123")
+        self.assertEqual(grabber.status.payment_url, ticket.get_order_detail_url("ORDER123"))
+        self.assertEqual(grabber.status.pay_qrcode_url, "https://pay.example/qr")
         send_all.assert_awaited_once()
         _, kwargs = send_all.await_args
         self.assertEqual(kwargs["title"], "会员购订单待支付")
-        self.assertEqual(kwargs["body"], "订单 ORDER123 已生成，请在 10 分钟内支付")
+        self.assertIn("订单 ORDER123 已生成，请在 10 分钟内支付", kwargs["body"])
+        self.assertIn(ticket.get_order_detail_url("ORDER123"), kwargs["body"])
 
     async def test_run_writes_sanitized_telemetry_and_report_summary(self) -> None:
         events: list[dict] = []
@@ -1415,6 +1440,109 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_buyers.await_count, 1)
         sleep_mock.assert_not_awaited()
 
+    async def test_create_order_receives_prepare_ptoken(self) -> None:
+        config = self.make_config()
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                )
+            ],
+        )
+        create_order = AsyncMock(return_value=ticket.CreateResult(code=100001, message="系统繁忙"))
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare(ptoken="ptoken=="))),
+            patch("app.grabber.ticket.create_order", new=create_order),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()),
+        ):
+            await grabber._run()
+
+        _, kwargs = create_order.await_args_list[0]
+        self.assertEqual(kwargs["ptoken"], "ptoken==")
+
+    async def test_prepare_expired_code_forces_reprepare(self) -> None:
+        config = self.make_config()
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                )
+            ],
+        )
+        prepare_order = AsyncMock(return_value=ok_prepare())
+        create_order = AsyncMock(
+            side_effect=[
+                ticket.CreateResult(code=100051, message="订单准备过期"),
+                ticket.CreateResult(code=100009, message="库存不足"),
+            ]
+        )
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch("app.grabber.ticket.prepare_order", new=prepare_order),
+            patch("app.grabber.ticket.create_order", new=create_order),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()),
+        ):
+            await grabber._run()
+
+        self.assertEqual(prepare_order.await_count, 2)
+        self.assertEqual(create_order.await_count, 2)
+
+    async def test_price_error_updates_pay_money_before_retry(self) -> None:
+        config = self.make_config()
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                )
+            ],
+        )
+        create_order = AsyncMock(
+            side_effect=[
+                ticket.CreateResult(code=100034, message="票价错误", pay_money=9900),
+                ticket.CreateResult(code=100009, message="库存不足"),
+            ]
+        )
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
+            patch("app.grabber.ticket.create_order", new=create_order),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()),
+        ):
+            await grabber._run()
+
+        first_args = create_order.await_args_list[0].args
+        second_args = create_order.await_args_list[1].args
+        self.assertEqual(first_args[7], 8800)
+        self.assertEqual(second_args[7], 9900)
+
     async def test_prepare_token_reused_on_congestion(self) -> None:
         config = self.make_config()
         grabber = Grabber(config)
@@ -1480,10 +1608,17 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int, payload: dict | None = None, raise_json: bool = False) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        payload: dict | None = None,
+        raise_json: bool = False,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self._payload = payload or {}
         self._raise_json = raise_json
+        self.headers = headers or {}
 
     def json(self) -> dict:
         if self._raise_json:
@@ -1491,9 +1626,119 @@ class _FakeResponse:
         return self._payload
 
 
+class TicketPayloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prepare_order_includes_request_limit_hint_and_parses_ptoken(self) -> None:
+        class FakeTicketClient:
+            csrf = "csrf-token"
+
+            def __init__(self) -> None:
+                self.post = AsyncMock(
+                    return_value=_FakeResponse(
+                        200,
+                        payload={
+                            "code": 0,
+                            "data": {"token": "prepare-token", "ptoken": "ptoken=="},
+                        },
+                    )
+                )
+
+        client = FakeTicketClient()
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="155", id_card="id")]
+
+        result = await ticket.prepare_order(client, 100, 200, 300, 1, buyers)  # type: ignore[arg-type]
+
+        self.assertEqual(result.token, "prepare-token")
+        self.assertEqual(result.ptoken, "ptoken==")
+        _, kwargs = client.post.await_args
+        payload = kwargs["json"]
+        self.assertIs(payload["ignoreRequestLimit"], True)
+        self.assertEqual(payload["requestSource"], "neul-next")
+        self.assertIs(payload["newRisk"], True)
+
+    async def test_create_order_transmits_ptoken_and_compatibility_fields(self) -> None:
+        class FakeTicketClient:
+            csrf = "csrf-token"
+
+            def __init__(self) -> None:
+                self.post = AsyncMock(
+                    return_value=_FakeResponse(
+                        200,
+                        payload={"code": 0, "data": {"orderId": "ORDER123"}},
+                    )
+                )
+
+        client = FakeTicketClient()
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="155", id_card="id")]
+
+        with patch("app.bili.ticket.time.time", return_value=123.456):
+            result = await ticket.create_order(
+                client,  # type: ignore[arg-type]
+                100,
+                200,
+                300,
+                1,
+                "prepare-token",
+                buyers,
+                8800,
+                ptoken="ptoken==",
+            )
+
+        self.assertEqual(result.order_id, "ORDER123")
+        _, kwargs = client.post.await_args
+        self.assertEqual(kwargs["params"]["ptoken"], "ptoken")
+        body = kwargs["json"]
+        self.assertEqual(body["ptoken"], "ptoken")
+        self.assertEqual(body["again"], 1)
+        self.assertEqual(body["timestamp"], 123456)
+        self.assertIs(body["newRisk"], True)
+        self.assertEqual(body["requestSource"], "neul-next")
+        self.assertEqual(body["orderCreateUrl"], ticket.CREATE_URL)
+
+    async def test_pay_qrcode_url_reads_pay_param_code_url(self) -> None:
+        class FakeTicketClient:
+            def __init__(self) -> None:
+                self.get_json = AsyncMock(
+                    return_value={"code": 0, "data": {"code_url": "https://pay.example/qr"}}
+                )
+
+        client = FakeTicketClient()
+
+        url = await ticket.get_pay_qrcode_url(client, "ORDER123")  # type: ignore[arg-type]
+
+        self.assertEqual(url, "https://pay.example/qr")
+        client.get_json.assert_awaited_once_with(ticket.PAY_PARAM_URL, params={"order_id": "ORDER123"})
+
+
 class ClientResilienceTests(unittest.IsolatedAsyncioTestCase):
     def make_client(self) -> BiliClient:
         return BiliClient("SESSDATA=s; bili_jct=c; DedeUserID=1")
+
+    async def test_sync_server_time_uses_response_date_header(self) -> None:
+        client = self.make_client()
+        date_header = format_datetime(datetime.fromtimestamp(1001, tz=timezone.utc), usegmt=True)
+        with (
+            patch.object(
+                client._client,
+                "head",
+                new=AsyncMock(return_value=_FakeResponse(200, headers={"date": date_header})),
+            ),
+            patch("app.bili.client.time.time", side_effect=[1000.0, 1000.2]),
+        ):
+            offset_ms = await client.sync_server_time()
+        self.assertEqual(offset_ms, 900)
+        await client.aclose()
+
+    async def test_prewarm_connection_returns_status_without_raising(self) -> None:
+        client = self.make_client()
+        with patch.object(
+            client._client,
+            "head",
+            new=AsyncMock(return_value=_FakeResponse(204)),
+        ) as head:
+            ok = await client.prewarm_connection()
+        self.assertTrue(ok)
+        head.assert_awaited_once()
+        await client.aclose()
 
     async def test_get_json_retries_non_json_response(self) -> None:
         client = self.make_client()

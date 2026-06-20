@@ -134,6 +134,19 @@ textarea { resize: vertical; }
 .last-msg { margin-top: 14px; font-size: 14px; color: var(--muted); }
 .last-msg.success { color: var(--green); font-weight: 600; }
 .retry-info { margin-top: 12px; font-size: 13px; color: #d29922; min-height: 18px; }
+.hidden { display: none !important; }
+.payment-box {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.payment-box span {
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 600;
+}
 
 .log {
   margin-top: 8px;

@@ -103,6 +103,8 @@ class GrabberStatus:
     retry_delay_ms: int = 0
     success: bool = False
     order_id: str = ""
+    payment_url: str = ""
+    pay_qrcode_url: str = ""
     waiting_captcha: bool = False
     finished_reason: str = ""
     congestion_count: int = 0
@@ -116,6 +118,9 @@ class GrabberStatus:
     effective_delay_ms: int = 0
     last_endpoint: str = ""
     effective_order_attempts: int = 0
+    time_offset_ms: int = 0
+    prewarm_ok: bool = False
+    transport: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -137,9 +142,12 @@ class Grabber:
         self._consecutive_network_errors = 0
         self._dynamic_interval = self._interval_seconds()
         self._cached_token = ""
+        self._cached_ptoken = ""
         self._cached_token_at = 0.0
         self._telemetry_path: Path | None = None
         self._run_started_at = 0.0
+        self._time_offset_seconds = 0.0
+        self._current_pay_money = 0
 
     # ---- 日志 ----
     def _emit(self, message: str, level: str = "info", **extra: Any) -> None:
@@ -196,6 +204,10 @@ class Grabber:
             "consecutive_rate_limits": self.status.consecutive_rate_limits,
             "stock_status": stock_status,
             "outcome": outcome,
+            "time_offset_ms": self.status.time_offset_ms,
+            "prewarm_ok": self.status.prewarm_ok,
+            "transport": self.status.transport,
+            "payment_url_present": bool(self.status.payment_url),
         }
         try:
             self._telemetry_path.parent.mkdir(parents=True, exist_ok=True)
@@ -223,6 +235,12 @@ class Grabber:
             "sold_out_count": self.status.sold_out_count,
             "network_errors": self.status.network_errors,
             "telemetry_path": self.status.telemetry_path,
+            "order_id": self.status.order_id,
+            "payment_url": self.status.payment_url,
+            "pay_qrcode_url": self.status.pay_qrcode_url,
+            "time_offset_ms": self.status.time_offset_ms,
+            "prewarm_ok": self.status.prewarm_ok,
+            "transport": self.status.transport,
             "elapsed_ms": elapsed_ms,
         }
 
@@ -279,10 +297,13 @@ class Grabber:
         if target is None:
             return
         self._set_phase(GrabPhase.START_WAIT)
+        initial_remaining = (target - self._now_for(target)).total_seconds()
+        if initial_remaining <= 0:
+            return
+        end_at = time.perf_counter() + initial_remaining
         last_logged_second: int | None = None
         while True:
-            now = self._now_for(target)
-            remaining = (target - now).total_seconds()
+            remaining = end_at - time.perf_counter()
             if remaining <= 0:
                 break
             current_second = int(remaining)
@@ -367,7 +388,7 @@ class Grabber:
         return target
 
     def _now_for(self, target: datetime) -> datetime:
-        return datetime.now(tz=target.tzinfo)
+        return datetime.now(tz=target.tzinfo) + timedelta(seconds=self._time_offset_seconds)
 
     def _interval_seconds(self) -> float:
         return self.config.interval_ms / 1000.0
@@ -413,6 +434,7 @@ class Grabber:
             return ""
         if time.perf_counter() - self._cached_token_at > _TOKEN_REUSE_SECONDS:
             self._cached_token = ""
+            self._cached_ptoken = ""
             return ""
         return self._cached_token
 
@@ -586,11 +608,15 @@ class Grabber:
         self._dynamic_interval = self._interval_seconds()
         self.status.dynamic_interval_ms = int(round(self._dynamic_interval * 1000))
         self._cached_token = ""
+        self._cached_ptoken = ""
         self._cached_token_at = 0.0
         self._telemetry_path = None
+        self._time_offset_seconds = 0.0
+        self._current_pay_money = 0
         self._start_telemetry()
         self._emit_status()
-        self._client = BiliClient(self.config.cookie)
+        self._client = BiliClient(self.config.cookie, http2_enabled=self.config.http2_enabled)
+        self.status.transport = getattr(self._client, "transport", "")
         try:
             if not self._client.is_logged_in:
                 self._emit("Cookie 不完整或未登录，无法抢票", "error")
@@ -598,9 +624,35 @@ class Grabber:
                 return
 
             start_target = self._parse_local_time(self.config.start_time, "开抢时间")
+            if self.config.time_sync_enabled and hasattr(self._client, "sync_server_time"):
+                try:
+                    offset_ms = await self._client.sync_server_time()
+                except Exception as exc:  # noqa: BLE001
+                    offset_ms = 0
+                    self._emit(f"服务端时间同步失败，将使用本机时间: {exc}", "warn")
+                else:
+                    self._emit(f"服务端时间偏移估算 {offset_ms}ms", "info")
+                self.status.time_offset_ms = offset_ms
+                self._time_offset_seconds = offset_ms / 1000.0
+                self._emit_status()
+
             self._set_phase(GrabPhase.PREWARM)
             await self._wait_until_prewarm(start_target)
             self._emit("开始抢票预热", "info")
+            if self.config.connection_prewarm_enabled and hasattr(self._client, "prewarm_connection"):
+                try:
+                    self.status.prewarm_ok = await self._client.prewarm_connection()
+                except Exception as exc:  # noqa: BLE001
+                    self.status.prewarm_ok = False
+                    self._emit(f"会员购连接预热异常，将继续抢票: {exc}", "warn")
+                    self._emit_status()
+                else:
+                    if self.status.prewarm_ok:
+                        self._emit(f"会员购连接已预热（{self.status.transport or 'http'}）", "info")
+                    else:
+                        self._emit("会员购连接预热失败，将继续抢票", "warn")
+                    self._emit_status()
+
             if await self._client.gen_bili_ticket():
                 self._emit("bili_ticket 已刷新", "info")
             else:
@@ -615,6 +667,7 @@ class Grabber:
                     raise RuntimeError("监控截止时间已过期")
 
             buyers, pay_money = await self._resolve_prewarm_data()
+            self._current_pay_money = pay_money
             self._emit(f"购票人 {len(buyers)} 人，票价 {pay_money / 100:.2f} 元", "info")
 
             await self._wait_until_start(start_target)
@@ -696,7 +749,9 @@ class Grabber:
         self.status.effective_delay_ms = 0
 
         token = self._reusable_token()
+        ptoken = ""
         if token:
+            ptoken = self._cached_ptoken
             self._emit(f"[{attempt}] 复用 prepare token，跳过预下单", "info")
         else:
             try:
@@ -723,6 +778,7 @@ class Grabber:
             except Exception as exc:  # noqa: BLE001 网络抖动等
                 self.status.last_prepare_ms = self._elapsed_ms(prepare_started_at)
                 self._cached_token = ""
+                self._cached_ptoken = ""
                 self.status.network_errors += 1
                 self._consecutive_network_errors += 1
                 self._record_attempt_timing(attempt_started_at)
@@ -740,12 +796,15 @@ class Grabber:
 
             if not prep.token:
                 self._cached_token = ""
+                self._cached_ptoken = ""
                 self._consecutive_network_errors = 0
                 self._record_attempt_timing(attempt_started_at)
                 return await self._handle_prepare_failure(prep, attempt, extra_params)
 
             token = prep.token
+            ptoken = prep.ptoken
             self._cached_token = token
+            self._cached_ptoken = ptoken
             self._cached_token_at = time.perf_counter()
 
         try:
@@ -760,14 +819,16 @@ class Grabber:
                 self.config.count,
                 token,
                 buyers,
-                pay_money,
+                self._current_pay_money or pay_money,
                 extra_params=extra_params or None,
+                ptoken=ptoken,
             )
             self.status.last_create_ms = self._elapsed_ms(create_started_at)
             self._consecutive_network_errors = 0
         except Exception as exc:  # noqa: BLE001 网络抖动等
             self.status.last_create_ms = self._elapsed_ms(create_started_at)
             self._cached_token = ""
+            self._cached_ptoken = ""
             self.status.network_errors += 1
             self._consecutive_network_errors += 1
             self._record_attempt_timing(attempt_started_at)
@@ -787,6 +848,7 @@ class Grabber:
 
         # 默认让 token 失效；仅在拥堵可重试时短时复用（见末尾分支）
         self._cached_token = ""
+        self._cached_ptoken = ""
 
         self.status.last_code = result.code
         self.status.last_message = result.message or describe(result.code)
@@ -817,7 +879,12 @@ class Grabber:
                 "success",
                 order_id=result.order_id,
             )
-            await self._notify_payment_required(result.order_id, success_message)
+            await self._prepare_payment_info(result.order_id)
+            await self._notify_payment_required(
+                result.order_id,
+                success_message,
+                payment_url=self.status.payment_url,
+            )
             return self._outcome_result(AttemptOutcome.STOP)
 
         if kind is ResultKind.FATAL:
@@ -830,6 +897,12 @@ class Grabber:
             if ok:
                 return self._retry_result("风控验证通过", self._interval_seconds())
             return self._retry_result("风控处理失败", self._rate_limit_retry_delay())
+
+        if result.code == 100051:
+            return self._retry_result("prepare token 过期，重新预下单", self._interval_seconds())
+
+        if result.code == 100034 and self._apply_corrected_pay_money(result.pay_money):
+            return self._retry_result("票价已刷新，重新预下单", self._interval_seconds())
 
         if self.config.return_monitor_enabled and kind is ResultKind.SOLD_OUT:
             self.status.sold_out_count += 1
@@ -848,6 +921,7 @@ class Grabber:
         self._set_phase(GrabPhase.CONGESTION_RETRY)
         self._on_retryable()
         self._cached_token = token  # 拥堵可重试，短时复用该 token
+        self._cached_ptoken = ptoken
         return self._retry_result("接口返回可重试", self._retry_delay())
 
     async def _handle_prepare_failure(
@@ -924,7 +998,42 @@ class Grabber:
             self.status.waiting_captcha = False
             self._emit_status()
 
-    async def _notify_payment_required(self, order_id: str, message: str = "订单已生成") -> None:
+    def _apply_corrected_pay_money(self, pay_money: int) -> bool:
+        if pay_money <= 0:
+            return False
+        if self.config.count > 1 and pay_money % self.config.count == 0:
+            pay_money = pay_money // self.config.count
+        if pay_money <= 0 or pay_money == self._current_pay_money:
+            return False
+        self._current_pay_money = pay_money
+        self._emit(f"票价已按接口提示刷新为 {pay_money / 100:.2f} 元", "warn")
+        return True
+
+    async def _prepare_payment_info(self, order_id: str) -> None:
+        if not self.config.payment_link_enabled or not order_id:
+            return
+        self.status.payment_url = ticket.get_order_detail_url(order_id)
+        try:
+            assert self._client is not None
+            self.status.pay_qrcode_url = await ticket.get_pay_qrcode_url(self._client, order_id)
+        except Exception as exc:  # noqa: BLE001
+            self._emit(f"支付二维码获取失败: {exc}", "warn")
+        self._record_telemetry(
+            "payment_info",
+            endpoint="payment",
+            attempt=self.status.attempts,
+            code=self.status.last_code,
+            outcome="ready" if self.status.payment_url else "unavailable",
+        )
+        self._emit_status()
+
+    async def _notify_payment_required(
+        self,
+        order_id: str,
+        message: str = "订单已生成",
+        *,
+        payment_url: str = "",
+    ) -> None:
         try:
             title = "会员购订单待支付"
             body = (
@@ -932,6 +1041,8 @@ class Grabber:
                 if order_id
                 else f"{message} 请尽快前往 B 站订单页支付"
             )
+            if payment_url:
+                body = f"{body}\n付款页：{payment_url}"
             await notify.send_all(
                 self.config.notify,
                 title=title,
@@ -944,7 +1055,7 @@ class Grabber:
 def _has_pending_order(message: str, code: int | None = None) -> bool:
     """会员购在已锁单/待支付时可能只返回提示文案，而不是标准成功码。"""
 
-    return code == 100048 or "尚未完成订单" in message or "待支付" in message
+    return code in {100003, 100048, 100079} or "尚未完成订单" in message or "待支付" in message
 
 
 # 预热解析时这些错误属于配置/校验问题，重试也不会变好，应立即中止

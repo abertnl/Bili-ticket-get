@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 import hmac
 import time
@@ -10,11 +12,11 @@ from typing import Any
 
 import httpx
 
-# 移动端 UA，会员购票务接口对移动端 UA 兼容更好
+# 稳定桌面浏览器 UA；保持请求头一致性，不做随机指纹伪装。
 DEFAULT_UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 "
-    "Mobile/15E148 Safari/604.1"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
 )
 
 DEFAULT_MAX_CONNECTIONS = 10
@@ -24,6 +26,7 @@ DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 5
 TRANSIENT_STATUS_CODES = frozenset({408, 412, 429, 500, 502, 503, 504})
 
 GEN_WEB_TICKET_URL = "https://api.bilibili.com/bapis/bilibili.api.ticket.v1.Ticket/GenWebTicket"
+SHOW_BASE_URL = "https://show.bilibili.com/"
 
 
 class JsonResponseError(ValueError):
@@ -54,9 +57,11 @@ class BiliClient:
         timeout: float = 10.0,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         max_keepalive_connections: int = DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
+        http2_enabled: bool = True,
     ) -> None:
         self.cookies = parse_cookie(cookie)
         self.timeout = timeout
+        self.transport = "http1"
         timeout_config = httpx.Timeout(
             timeout,
             connect=min(timeout, 5.0),
@@ -69,18 +74,33 @@ class BiliClient:
             max_keepalive_connections=max_keepalive_connections,
             keepalive_expiry=30.0,
         )
-        self._client = httpx.AsyncClient(
-            timeout=timeout_config,
-            limits=limits,
-            headers={
+        client_kwargs: dict[str, Any] = {
+            "timeout": timeout_config,
+            "limits": limits,
+            "headers": {
                 "User-Agent": DEFAULT_UA,
                 "Referer": "https://show.bilibili.com/",
+                "Origin": "https://show.bilibili.com",
                 "Accept": "application/json, text/plain, */*",
-                "Connection": "keep-alive",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+                "sec-ch-ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"macOS"',
             },
-            cookies=self.cookies,
-            follow_redirects=True,
-        )
+            "cookies": self.cookies,
+            "follow_redirects": True,
+        }
+        if http2_enabled:
+            try:
+                self._client = httpx.AsyncClient(http2=True, **client_kwargs)
+                self.transport = "http2"
+            except ImportError:
+                self._client = httpx.AsyncClient(http2=False, **client_kwargs)
+        else:
+            self._client = httpx.AsyncClient(http2=False, **client_kwargs)
 
     # ---- 凭据快捷访问 ----
     @property
@@ -115,6 +135,9 @@ class BiliClient:
 
     async def post(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self._client.post(url, **kwargs)
+
+    async def head(self, url: str, **kwargs: Any) -> httpx.Response:
+        return await self._client.head(url, **kwargs)
 
     async def get_json(self, url: str, **kwargs: Any) -> dict[str, Any]:
         return await self._request_json_with_retry("GET", url, **kwargs)
@@ -160,6 +183,37 @@ class BiliClient:
                 await asyncio.sleep(backoff * (attempt + 1))
         assert last_exc is not None
         raise last_exc
+
+    async def sync_server_time(self, url: str = SHOW_BASE_URL) -> int:
+        """用服务端 Date 头估算本机时钟偏移，失败时返回 0 毫秒。"""
+
+        started = time.time()
+        try:
+            resp = await self.head(url)
+        except httpx.HTTPError:
+            return 0
+        ended = time.time()
+        date_header = resp.headers.get("date", "")
+        if not date_header:
+            return 0
+        try:
+            parsed = parsedate_to_datetime(date_header)
+        except (TypeError, ValueError, AttributeError, OverflowError):
+            return 0
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        server_time = parsed.timestamp()
+        local_midpoint = (started + ended) / 2.0
+        return int(round((server_time - local_midpoint) * 1000))
+
+    async def prewarm_connection(self, url: str = SHOW_BASE_URL) -> bool:
+        """预热 show.bilibili.com 连接；失败只影响返回值，不抛出。"""
+
+        try:
+            resp = await self.head(url)
+        except httpx.HTTPError:
+            return False
+        return resp.status_code < 500
 
     # ---- bili_ticket（降低风控触发概率） ----
     async def gen_bili_ticket(self) -> str | None:
