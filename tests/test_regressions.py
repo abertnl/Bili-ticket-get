@@ -267,6 +267,7 @@ class ServerConfigTests(unittest.TestCase):
             {"max_attempts": 0},
             {"prewarm_seconds": -1},
             {"rate_limit_backoff_ms": 999},
+            {"rate_limit_cooldown_ms": 999},
             {"network_backoff_max_ms": 99},
             {"monitor_interval_ms": 999},
             {"captcha_mode": "bad"},
@@ -829,6 +830,42 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         sleep_mock.assert_awaited_once_with(2.0)
         self.assertEqual(grabber.status.retry_reason, "")
         self.assertEqual(grabber.status.retry_delay_ms, 0)
+
+    async def test_repeated_rate_limits_enter_cooldown(self) -> None:
+        config = self.make_config()
+        config.interval_ms = 1000
+        config.max_interval_ms = 3000
+        config.max_attempts = 4
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "sale", 1)],
+                )
+            ],
+        )
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
+            patch(
+                "app.grabber.ticket.create_order",
+                new=AsyncMock(return_value=ticket.CreateResult(code=429, message="HTTP 429")),
+            ),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+        ):
+            await grabber._run()
+
+        self.assertEqual([args.args[0] for args in sleep_mock.await_args_list], [2.0, 3.0, 8.0])
+        self.assertEqual(grabber.status.rate_limit_count, 4)
+        self.assertEqual(grabber.status.finished_reason, "达到最大尝试次数")
 
     async def test_initialization_resolves_buyers_and_price_before_start_time(self) -> None:
         events: list[dict] = []

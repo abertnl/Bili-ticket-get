@@ -105,6 +105,11 @@
             <input type="number" id="rateLimitBackoffInput" min="1000" value="2000" />
           </div>
           <div class="row">
+            <label>连续限流冷却(ms)</label>
+            <input type="number" id="rateLimitCooldownInput" min="1000" value="8000" />
+            <p class="field-hint">连续 429/412 时进入更长冷却，避免一直卡在限流窗口。</p>
+          </div>
+          <div class="row">
             <label>网络退避上限(ms)</label>
             <input type="number" id="networkBackoffMaxInput" min="100" value="3000" />
           </div>

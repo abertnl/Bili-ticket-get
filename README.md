@@ -62,6 +62,7 @@ uv run main.py
 | `max_attempts` | 最大尝试次数 | `300` |
 | `prewarm_seconds` | 开抢前预热提前量（秒） | `30` |
 | `rate_limit_backoff_ms` | 限流退避（毫秒） | `2000` |
+| `rate_limit_cooldown_ms` | 连续限流冷却（毫秒） | `8000` |
 | `captcha_mode` | 验证码方式：`manual` / `rrocr` | `manual` |
 | `return_monitor_enabled` | 启用回流票监控 | `false` |
 | `notify.bark_url` | Bark 推送地址 | `""` |
@@ -103,7 +104,7 @@ uv run main.py
 
 | 现象 | 解决方法 |
 |------|----------|
-| 一直返回 `429` | 增大 `interval_ms`，建议 1000ms 以上 |
+| 一直返回 `429` | 增大 `interval_ms`，并把 `rate_limit_cooldown_ms` 调到 8000ms 以上 |
 | 触发 `-352` 风控 | 按页面提示完成人机验证，适当降低频率 |
 | 加载购票人失败 | 重新登录，确认账号已添加实名购票人 |
 | 售罄 (`100009`) | 启用回流票监控，等待退票释放库存 |

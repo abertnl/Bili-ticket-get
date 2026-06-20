@@ -111,6 +111,7 @@ class ConfigUpdate(BaseModel):
     max_attempts: int | None = Field(default=None, ge=1)
     prewarm_seconds: int | None = Field(default=None, ge=0)
     rate_limit_backoff_ms: int | None = Field(default=None, ge=1000)
+    rate_limit_cooldown_ms: int | None = Field(default=None, ge=1000)
     network_backoff_max_ms: int | None = Field(default=None, ge=100)
     adaptive_rate_enabled: bool | None = None
     max_interval_ms: int | None = Field(default=None, ge=100)

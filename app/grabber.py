@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
+import re
 import time
 from typing import Any
 
@@ -23,6 +24,9 @@ EventCallback = Callable[[dict[str, Any]], None]
 
 # prepare token 最长复用时长（秒）：仅在拥堵可重试时短时复用，减半请求量
 _TOKEN_REUSE_SECONDS = 2.5
+# 连续触发限流后进入更长冷却。短间隔会把同一账号/IP持续压在 429 窗口里。
+_RATE_LIMIT_COOLDOWN_AFTER = 3
+_RATE_LIMIT_COOLDOWN_MAX_SECONDS = 30.0
 
 
 class AttemptOutcome(str, Enum):
@@ -295,7 +299,12 @@ class Grabber:
     def _rate_limit_retry_delay(self) -> float:
         self._on_rate_limit()
         base = self._dynamic_interval if self.config.adaptive_rate_enabled else self._interval_seconds()
-        return max(base, self.config.rate_limit_backoff_ms / 1000.0)
+        delay = max(base, self.config.rate_limit_backoff_ms / 1000.0)
+        if self.status.consecutive_rate_limits >= _RATE_LIMIT_COOLDOWN_AFTER:
+            cooldown = self.config.rate_limit_cooldown_ms / 1000.0
+            cooldown_round = self.status.consecutive_rate_limits - _RATE_LIMIT_COOLDOWN_AFTER
+            delay = max(delay, min(cooldown * (2**cooldown_round), _RATE_LIMIT_COOLDOWN_MAX_SECONDS))
+        return delay
 
     def _retry_result(self, reason: str, delay: float) -> AttemptResult:
         self.status.retry_reason = reason
@@ -357,12 +366,22 @@ class Grabber:
                 project = await ticket.get_project(self._client, self.config.project_id)
                 sku = self._find_target_sku(project)
             except Exception as exc:  # noqa: BLE001
+                rate_limit_code = _rate_limit_code_from_exception(exc)
+                delay = min(interval, remaining)
+                if rate_limit_code is not None:
+                    self.status.last_code = rate_limit_code
+                    self.status.last_message = f"HTTP {rate_limit_code}"
+                    delay = min(max(interval, self._rate_limit_retry_delay()), remaining)
+                    self.status.retry_reason = "监控请求过频/风控拦截"
+                    self.status.retry_delay_ms = int(round(delay * 1000))
                 self.status.last_stock_status = f"监控异常: {exc}"
                 self._emit(f"[监控 {self.status.monitor_checks}] 获取票档失败: {exc}", "warn")
                 self._emit_status()
-                await asyncio.sleep(min(interval, remaining))
+                await asyncio.sleep(delay)
                 continue
 
+            if self.status.retry_reason == "监控请求过频/风控拦截":
+                self._clear_retry_status()
             self.status.last_stock_status = self._format_stock_status(sku)
             self._emit(
                 f"[监控 {self.status.monitor_checks}] {self.status.last_stock_status}",
@@ -719,3 +738,10 @@ _PERMANENT_RESOLVE_KEYWORDS = (
 def _is_permanent_resolve_error(exc: Exception) -> bool:
     message = str(exc)
     return any(keyword in message for keyword in _PERMANENT_RESOLVE_KEYWORDS)
+
+
+def _rate_limit_code_from_exception(exc: Exception) -> int | None:
+    match = re.search(r"\b(412|429)\b", str(exc))
+    if not match:
+        return None
+    return int(match.group(1))
