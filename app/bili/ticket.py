@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,6 +15,8 @@ BUYER_LIST_URL = f"{BASE}/api/ticket/buyer/list"
 PREPARE_URL = f"{BASE}/api/ticket/order/prepare"
 CREATE_URL = f"{BASE}/api/ticket/order/createV2"
 ORDER_INFO_URL = f"{BASE}/api/ticket/order/info"
+PAY_PARAM_URL = f"{BASE}/api/ticket/order/getPayParam"
+ORDER_DETAIL_URL = f"{BASE}/platform/orderDetail.html"
 
 
 @dataclass
@@ -63,6 +66,7 @@ class PrepareResult:
     code: int
     message: str
     token: str = ""
+    ptoken: str = ""
     v_voucher: str = ""           # 触发风控时的凭据
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -75,6 +79,7 @@ class CreateResult:
     message: str
     order_id: str = ""
     pay_token: str = ""
+    pay_money: int = 0
     v_voucher: str = ""           # 触发风控时的凭据
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -93,6 +98,33 @@ def build_buyer_info(buyers: list[Buyer]) -> list[dict[str, Any]]:
         }
         for b in buyers
     ]
+
+
+def build_contact_info(
+    buyers: list[Buyer],
+    contact_name: str = "",
+    contact_tel: str = "",
+) -> dict[str, str]:
+    """构造部分项目要求的顶层联系人字段。"""
+
+    fallback = buyers[0] if buyers else None
+    name = (contact_name or (fallback.name if fallback else "")).strip()
+    tel = (contact_tel or (fallback.tel if fallback else "")).strip()
+    if not name or not tel:
+        return {}
+    return {"buyer": name, "tel": tel}
+
+
+def _dict_data(data: dict[str, Any]) -> dict[str, Any]:
+    inner = data.get("data", {})
+    return inner if isinstance(inner, dict) else {}
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 async def get_project(client: BiliClient, project_id: int) -> Project:
@@ -161,6 +193,7 @@ async def prepare_order(
         "count": count,
         "sku_id": sku_id,
         "buyer_info": build_buyer_info(buyers),
+        "ignoreRequestLimit": True,
         "ticket_agent": "",
         "token": "",
         "requestSource": "neul-next",
@@ -173,14 +206,21 @@ async def prepare_order(
     except ValueError:
         return PrepareResult(code=resp.status_code, message=f"HTTP {resp.status_code}", raw={})
 
-    inner = data.get("data", {}) or {}
+    inner = _dict_data(data)
     return PrepareResult(
         code=data.get("code", data.get("errno", resp.status_code)),
         message=data.get("msg") or data.get("message", ""),
         token=inner.get("token", ""),
+        ptoken=inner.get("ptoken", ""),
         v_voucher=inner.get("v_voucher", "") or resp.headers.get("x-bili-gaia-vvoucher", ""),
         raw=data,
     )
+
+
+def normalize_prepare_ptoken(value: str | None) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("=", "")
 
 
 async def create_order(
@@ -193,6 +233,9 @@ async def create_order(
     buyers: list[Buyer],
     pay_money: int,
     extra_params: dict[str, Any] | None = None,
+    ptoken: str = "",
+    contact_name: str = "",
+    contact_tel: str = "",
 ) -> CreateResult:
     """提交订单（核心抢票请求）。
 
@@ -200,6 +243,9 @@ async def create_order(
     """
 
     buyer_info = build_buyer_info(buyers)
+    contact_info = build_contact_info(buyers, contact_name, contact_tel)
+    now_ms = int(time.time() * 1000)
+    normalized_ptoken = normalize_prepare_ptoken(ptoken)
     body = {
         "project_id": project_id,
         "screen_id": screen_id,
@@ -207,12 +253,21 @@ async def create_order(
         "count": count,
         "order_type": 1,
         "pay_money": pay_money * count if pay_money else 0,
+        "again": 1,
         "token": token,
+        "timestamp": now_ms,
+        "newRisk": True,
+        "requestSource": "neul-next",
+        "orderCreateUrl": CREATE_URL,
         "deviceId": "",
         "buyer_info": json.dumps(buyer_info, ensure_ascii=False),
         "csrf": client.csrf,
     }
+    body.update(contact_info)
     params: dict[str, Any] = {"project_id": project_id}
+    if normalized_ptoken:
+        body["ptoken"] = normalized_ptoken
+        params["ptoken"] = normalized_ptoken
     if extra_params:
         params.update(extra_params)
 
@@ -223,12 +278,25 @@ async def create_order(
         # 例如 429 直接返回非 JSON
         return CreateResult(code=resp.status_code, message=f"HTTP {resp.status_code}", raw={})
 
-    inner = data.get("data", {}) or {}
+    inner = _dict_data(data)
     return CreateResult(
         code=data.get("code", data.get("errno", resp.status_code)),
         message=data.get("msg") or data.get("message", ""),
         order_id=str(inner.get("orderId", "") or inner.get("order_id", "")),
         pay_token=inner.get("token", ""),
+        pay_money=_int_or_zero(inner.get("pay_money") or inner.get("payMoney") or data.get("pay_money")),
         v_voucher=inner.get("v_voucher", "") or resp.headers.get("x-bili-gaia-vvoucher", ""),
         raw=data,
     )
+
+
+def get_order_detail_url(order_id: int | str) -> str:
+    return f"{ORDER_DETAIL_URL}?order_id={order_id}"
+
+
+async def get_pay_qrcode_url(client: BiliClient, order_id: int | str) -> str:
+    data = await client.get_json(PAY_PARAM_URL, params={"order_id": order_id})
+    code = data.get("code", data.get("errno", -1))
+    if code != 0:
+        return ""
+    return str(data.get("data", {}).get("code_url", "") or "")

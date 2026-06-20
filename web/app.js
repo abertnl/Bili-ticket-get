@@ -270,6 +270,8 @@ function collectConfig() {
     screen_id: parseInt($("screenSelect").value || "0", 10),
     sku_id: parseInt($("skuSelect").value || "0", 10),
     buyer_ids: buyerIds,
+    contact_name: $("contactNameInput").value.trim(),
+    contact_tel: $("contactTelInput").value.trim(),
     count: parseInt($("countInput").value || "1", 10),
     start_time: collectStartTime(),
     interval_ms: parseInt($("intervalInput").value || "800", 10),
@@ -316,6 +318,8 @@ async function loadConfig() {
   setSavedSelect("screenSelect", c.screen_id || 0, "场次");
   setSavedSelect("skuSelect", c.sku_id || 0, "票档");
   renderSavedBuyerIds(c.buyer_ids || []);
+  $("contactNameInput").value = c.contact_name || "";
+  $("contactTelInput").value = c.contact_tel || "";
   $("countInput").value = c.count || 1;
   $("intervalInput").value = c.interval_ms || 800;
   $("maxAttemptsInput").value = c.max_attempts || 300;
@@ -362,9 +366,14 @@ function applyStatus(s) {
   $("statAvgAttemptMs").textContent = `${s.avg_attempt_ms ?? 0}ms`;
   $("statNetworkErrors").textContent = s.network_errors ?? 0;
   $("statRateLimit").textContent = s.rate_limit_count ?? 0;
+  $("statCongestion").textContent = s.congestion_count ?? 0;
+  $("statSoldOut").textContent = s.sold_out_count ?? 0;
   $("statDynamicInterval").textContent = `${s.dynamic_interval_ms ?? 0}ms`;
   $("statEffectiveOrders").textContent = s.effective_order_attempts ?? 0;
   $("statPhase").textContent = s.phase || "idle";
+  $("statTimeOffset").textContent = `${s.time_offset_ms ?? 0}ms`;
+  $("statPrewarm").textContent = s.prewarm_ok ? "成功" : "-";
+  $("statTransport").textContent = s.transport || "-";
   $("statTelemetryPath").textContent = s.telemetry_path || "-";
   $("statTelemetryPath").title = s.telemetry_path || "";
   $("retryInfo").textContent = s.running && s.retry_reason
@@ -374,6 +383,17 @@ function applyStatus(s) {
   $("lastMsg").textContent = detail;
   $("statState").classList.toggle("success", !!s.success);
   $("lastMsg").classList.toggle("success", !!s.success);
+  const hasPayment = !!s.payment_url;
+  $("paymentBox").classList.toggle("hidden", !hasPayment);
+  $("orderIdText").textContent = s.order_id ? `订单 ${s.order_id}` : "";
+  if (hasPayment) {
+    $("paymentUrl").href = s.payment_url;
+  }
+  const hasQr = !!s.pay_qrcode_url;
+  $("payQrUrl").classList.toggle("hidden", !hasQr);
+  if (hasQr) {
+    $("payQrUrl").href = s.pay_qrcode_url;
+  }
   if (s.waiting_captcha) checkCaptcha();
 }
 

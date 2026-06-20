@@ -105,6 +105,8 @@ class ConfigUpdate(BaseModel):
     screen_id: int | None = Field(default=None, ge=0)
     sku_id: int | None = Field(default=None, ge=0)
     buyer_ids: list[int] | None = None
+    contact_name: str | None = Field(default=None, max_length=64)
+    contact_tel: str | None = Field(default=None, max_length=32)
     count: int | None = Field(default=None, ge=1)
     start_time: str | None = Field(default=None, max_length=64)
     interval_ms: int | None = Field(default=None, ge=100)
@@ -115,6 +117,10 @@ class ConfigUpdate(BaseModel):
     network_backoff_max_ms: int | None = Field(default=None, ge=100)
     adaptive_rate_enabled: bool | None = None
     max_interval_ms: int | None = Field(default=None, ge=100)
+    time_sync_enabled: bool | None = None
+    connection_prewarm_enabled: bool | None = None
+    http2_enabled: bool | None = None
+    payment_link_enabled: bool | None = None
     sold_out_burst_attempts: int | None = Field(default=None, ge=1)
     return_monitor_enabled: bool | None = None
     monitor_interval_ms: int | None = Field(default=None, ge=1000)
@@ -577,6 +583,12 @@ async def grab_report() -> dict[str, Any]:
             "sold_out_count": 0,
             "network_errors": 0,
             "telemetry_path": "",
+            "order_id": "",
+            "payment_url": "",
+            "pay_qrcode_url": "",
+            "time_offset_ms": 0,
+            "prewarm_ok": False,
+            "transport": "",
             "elapsed_ms": 0,
         }
     return state.grabber.report()

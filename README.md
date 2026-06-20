@@ -58,6 +58,7 @@ uv run main.py
 | `project_id` | 演出 ID | — |
 | `screen_id` / `sku_id` | 场次 / 票档 ID | — |
 | `buyer_ids` | 购票人 ID 列表 | `[]` |
+| `contact_name` / `contact_tel` | 联系人姓名 / 手机号（部分项目必填，留空使用首位购票人） | `""` |
 | `count` | 购买张数 | `1` |
 | `start_time` | 开抢时间（ISO 格式，留空立即开始） | `""` |
 | `interval_ms` | 请求间隔（毫秒） | `800` |

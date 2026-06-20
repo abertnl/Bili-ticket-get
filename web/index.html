@@ -71,6 +71,10 @@
         <h2>购票人</h2>
         <button class="btn ghost" id="loadBuyersBtn">加载购票人</button>
         <div id="buyerList" class="buyer-list"></div>
+        <div class="contact-grid">
+          <div class="row"><label>联系人姓名</label><input id="contactNameInput" placeholder="姓名" /></div>
+          <div class="row"><label>联系人手机号</label><input id="contactTelInput" placeholder="手机号" inputmode="tel" /></div>
+        </div>
       </div>
 
       <div class="card">
@@ -165,9 +169,14 @@
             <div class="stat"><span class="num" id="statAvgAttemptMs">0ms</span><span class="lbl">平均耗时</span></div>
             <div class="stat"><span class="num" id="statNetworkErrors">0</span><span class="lbl">网络异常</span></div>
             <div class="stat"><span class="num" id="statRateLimit">0</span><span class="lbl">限流次数</span></div>
+            <div class="stat"><span class="num" id="statCongestion">0</span><span class="lbl">拥堵次数</span></div>
+            <div class="stat"><span class="num" id="statSoldOut">0</span><span class="lbl">售罄次数</span></div>
             <div class="stat"><span class="num" id="statDynamicInterval">0ms</span><span class="lbl">当前间隔</span></div>
             <div class="stat"><span class="num" id="statEffectiveOrders">0</span><span class="lbl">有效下单</span></div>
             <div class="stat"><span class="num" id="statPhase">idle</span><span class="lbl">策略阶段</span></div>
+            <div class="stat"><span class="num" id="statTimeOffset">0ms</span><span class="lbl">时间偏移</span></div>
+            <div class="stat"><span class="num" id="statPrewarm">-</span><span class="lbl">连接预热</span></div>
+            <div class="stat"><span class="num" id="statTransport">-</span><span class="lbl">传输</span></div>
             <div class="stat stat-wide"><span class="num path" id="statTelemetryPath">-</span><span class="lbl">复盘文件</span></div>
           </div>
           <div class="controls">
@@ -177,6 +186,11 @@
         </div>
         <div class="retry-info" id="retryInfo"></div>
         <div id="lastMsg" class="last-msg"></div>
+        <div id="paymentBox" class="payment-box hidden">
+          <span id="orderIdText"></span>
+          <a id="paymentUrl" class="btn" href="#" target="_blank" rel="noreferrer">打开付款页</a>
+          <a id="payQrUrl" class="btn ghost hidden" href="#" target="_blank" rel="noreferrer">打开二维码</a>
+        </div>
       </div>
 
       <div class="card">

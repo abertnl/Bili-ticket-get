@@ -105,6 +105,8 @@ class AppConfig(BaseModel):
     screen_id: int = 0
     sku_id: int = 0
     buyer_ids: list[int] = Field(default_factory=list)
+    contact_name: str = Field(default="", max_length=64, description="联系人姓名；为空时使用第一个购票人")
+    contact_tel: str = Field(default="", max_length=32, description="联系人手机号；为空时使用第一个购票人手机号")
     count: int = 1
 
     start_time: str = Field(default="", max_length=64, description="ISO 时间，如 2026-06-08T20:00:00，留空表示立即开抢")
@@ -116,6 +118,10 @@ class AppConfig(BaseModel):
     network_backoff_max_ms: int = Field(default=3000, ge=100, description="网络异常指数退避的最大等待（毫秒）")
     adaptive_rate_enabled: bool = Field(default=True, description="启用 AIMD 自适应限速：遇 429/412 退避，顺畅时逐步加速")
     max_interval_ms: int = Field(default=3000, ge=100, description="自适应限速的间隔上限（毫秒），interval_ms 为下限")
+    time_sync_enabled: bool = Field(default=True, description="开抢前用服务端 Date 头估算本机时间偏移")
+    connection_prewarm_enabled: bool = Field(default=True, description="开抢前预热会员购连接，减少首个请求建连开销")
+    http2_enabled: bool = Field(default=True, description="HTTP 客户端优先尝试 HTTP/2，不可用时自动回退")
+    payment_link_enabled: bool = Field(default=True, description="订单生成后尝试获取付款入口和二维码链接")
     sold_out_burst_attempts: int = Field(default=6, ge=1, description="启用回流监控时，下单遇库存不足连续冲刺多少次再回监控")
     return_monitor_enabled: bool = Field(default=False, description="是否启用回流票低频监控")
     monitor_interval_ms: int = Field(default=5000, ge=1000, description="回流票监控间隔（毫秒）")
@@ -126,6 +132,22 @@ class AppConfig(BaseModel):
 
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
+
+    @field_validator("contact_name")
+    @classmethod
+    def validate_contact_name(cls, value: str) -> str:
+        value = value.strip()
+        if value and not 2 <= len(value) <= 15:
+            raise ValueError("联系人姓名长度需为 2-15 个字符")
+        return value
+
+    @field_validator("contact_tel")
+    @classmethod
+    def validate_contact_tel(cls, value: str) -> str:
+        value = value.strip()
+        if value and not re.fullmatch(r"1[0-9]{10}", value):
+            raise ValueError("联系人手机号必须是 11 位手机号")
+        return value
 
 
 def load_config(path: Path | None = None) -> AppConfig:
