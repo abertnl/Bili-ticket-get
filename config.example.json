@@ -4,6 +4,8 @@
   "screen_id": 0,
   "sku_id": 0,
   "buyer_ids": [],
+  "contact_name": "",
+  "contact_tel": "",
   "count": 1,
   "start_time": "",
   "interval_ms": 800,

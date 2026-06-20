@@ -105,6 +105,8 @@ class ConfigUpdate(BaseModel):
     screen_id: int | None = Field(default=None, ge=0)
     sku_id: int | None = Field(default=None, ge=0)
     buyer_ids: list[int] | None = None
+    contact_name: str | None = Field(default=None, max_length=64)
+    contact_tel: str | None = Field(default=None, max_length=32)
     count: int | None = Field(default=None, ge=1)
     start_time: str | None = Field(default=None, max_length=64)
     interval_ms: int | None = Field(default=None, ge=100)

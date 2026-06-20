@@ -1694,6 +1694,68 @@ class TicketPayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["requestSource"], "neul-next")
         self.assertEqual(body["orderCreateUrl"], ticket.CREATE_URL)
 
+    async def test_create_order_transmits_contact_fields(self) -> None:
+        class FakeTicketClient:
+            csrf = "csrf-token"
+
+            def __init__(self) -> None:
+                self.post = AsyncMock(
+                    return_value=_FakeResponse(
+                        200,
+                        payload={"code": 0, "data": {"orderId": "ORDER123"}},
+                    )
+                )
+
+        client = FakeTicketClient()
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="155", id_card="id")]
+
+        await ticket.create_order(
+            client,  # type: ignore[arg-type]
+            100,
+            200,
+            300,
+            1,
+            "prepare-token",
+            buyers,
+            8800,
+            contact_name="Carol",
+            contact_tel="18800001111",
+        )
+
+        _, kwargs = client.post.await_args
+        body = kwargs["json"]
+        self.assertEqual(body["buyer"], "Carol")
+        self.assertEqual(body["tel"], "18800001111")
+
+    async def test_create_order_uses_first_buyer_as_contact_fallback(self) -> None:
+        class FakeTicketClient:
+            csrf = "csrf-token"
+
+            def __init__(self) -> None:
+                self.post = AsyncMock(return_value=_FakeResponse(200, payload={"code": 0}))
+
+        client = FakeTicketClient()
+        buyers = [
+            ticket.Buyer(buyer_id=1, name="Alice", tel="18800001111", id_card="id"),
+            ticket.Buyer(buyer_id=2, name="Bob", tel="18800002222", id_card="id"),
+        ]
+
+        await ticket.create_order(
+            client,  # type: ignore[arg-type]
+            100,
+            200,
+            300,
+            2,
+            "prepare-token",
+            buyers,
+            8800,
+        )
+
+        _, kwargs = client.post.await_args
+        body = kwargs["json"]
+        self.assertEqual(body["buyer"], "Alice")
+        self.assertEqual(body["tel"], "18800001111")
+
     async def test_pay_qrcode_url_reads_pay_param_code_url(self) -> None:
         class FakeTicketClient:
             def __init__(self) -> None:

@@ -270,6 +270,8 @@ function collectConfig() {
     screen_id: parseInt($("screenSelect").value || "0", 10),
     sku_id: parseInt($("skuSelect").value || "0", 10),
     buyer_ids: buyerIds,
+    contact_name: $("contactNameInput").value.trim(),
+    contact_tel: $("contactTelInput").value.trim(),
     count: parseInt($("countInput").value || "1", 10),
     start_time: collectStartTime(),
     interval_ms: parseInt($("intervalInput").value || "800", 10),
@@ -316,6 +318,8 @@ async function loadConfig() {
   setSavedSelect("screenSelect", c.screen_id || 0, "场次");
   setSavedSelect("skuSelect", c.sku_id || 0, "票档");
   renderSavedBuyerIds(c.buyer_ids || []);
+  $("contactNameInput").value = c.contact_name || "";
+  $("contactTelInput").value = c.contact_tel || "";
   $("countInput").value = c.count || 1;
   $("intervalInput").value = c.interval_ms || 800;
   $("maxAttemptsInput").value = c.max_attempts || 300;

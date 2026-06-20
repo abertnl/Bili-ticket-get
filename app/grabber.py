@@ -822,6 +822,8 @@ class Grabber:
                 self._current_pay_money or pay_money,
                 extra_params=extra_params or None,
                 ptoken=ptoken,
+                contact_name=self.config.contact_name,
+                contact_tel=self.config.contact_tel,
             )
             self.status.last_create_ms = self._elapsed_ms(create_started_at)
             self._consecutive_network_errors = 0

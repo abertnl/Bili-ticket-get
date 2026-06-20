@@ -105,6 +105,8 @@ class AppConfig(BaseModel):
     screen_id: int = 0
     sku_id: int = 0
     buyer_ids: list[int] = Field(default_factory=list)
+    contact_name: str = Field(default="", max_length=64, description="联系人姓名；为空时使用第一个购票人")
+    contact_tel: str = Field(default="", max_length=32, description="联系人手机号；为空时使用第一个购票人手机号")
     count: int = 1
 
     start_time: str = Field(default="", max_length=64, description="ISO 时间，如 2026-06-08T20:00:00，留空表示立即开抢")
@@ -130,6 +132,22 @@ class AppConfig(BaseModel):
 
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
+
+    @field_validator("contact_name")
+    @classmethod
+    def validate_contact_name(cls, value: str) -> str:
+        value = value.strip()
+        if value and not 2 <= len(value) <= 15:
+            raise ValueError("联系人姓名长度需为 2-15 个字符")
+        return value
+
+    @field_validator("contact_tel")
+    @classmethod
+    def validate_contact_tel(cls, value: str) -> str:
+        value = value.strip()
+        if value and not re.fullmatch(r"1[0-9]{10}", value):
+            raise ValueError("联系人手机号必须是 11 位手机号")
+        return value
 
 
 def load_config(path: Path | None = None) -> AppConfig:

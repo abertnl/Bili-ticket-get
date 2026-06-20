@@ -100,6 +100,21 @@ def build_buyer_info(buyers: list[Buyer]) -> list[dict[str, Any]]:
     ]
 
 
+def build_contact_info(
+    buyers: list[Buyer],
+    contact_name: str = "",
+    contact_tel: str = "",
+) -> dict[str, str]:
+    """构造部分项目要求的顶层联系人字段。"""
+
+    fallback = buyers[0] if buyers else None
+    name = (contact_name or (fallback.name if fallback else "")).strip()
+    tel = (contact_tel or (fallback.tel if fallback else "")).strip()
+    if not name or not tel:
+        return {}
+    return {"buyer": name, "tel": tel}
+
+
 def _dict_data(data: dict[str, Any]) -> dict[str, Any]:
     inner = data.get("data", {})
     return inner if isinstance(inner, dict) else {}
@@ -219,6 +234,8 @@ async def create_order(
     pay_money: int,
     extra_params: dict[str, Any] | None = None,
     ptoken: str = "",
+    contact_name: str = "",
+    contact_tel: str = "",
 ) -> CreateResult:
     """提交订单（核心抢票请求）。
 
@@ -226,6 +243,7 @@ async def create_order(
     """
 
     buyer_info = build_buyer_info(buyers)
+    contact_info = build_contact_info(buyers, contact_name, contact_tel)
     now_ms = int(time.time() * 1000)
     normalized_ptoken = normalize_prepare_ptoken(ptoken)
     body = {
@@ -245,6 +263,7 @@ async def create_order(
         "buyer_info": json.dumps(buyer_info, ensure_ascii=False),
         "csrf": client.csrf,
     }
+    body.update(contact_info)
     params: dict[str, Any] = {"project_id": project_id}
     if normalized_ptoken:
         body["ptoken"] = normalized_ptoken
