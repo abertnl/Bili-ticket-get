@@ -122,7 +122,11 @@ class AppConfig(BaseModel):
     connection_prewarm_enabled: bool = Field(default=True, description="开抢前预热会员购连接，减少首个请求建连开销")
     http2_enabled: bool = Field(default=True, description="HTTP 客户端优先尝试 HTTP/2，不可用时自动回退")
     payment_link_enabled: bool = Field(default=True, description="订单生成后尝试获取付款入口和二维码链接")
-    sold_out_burst_attempts: int = Field(default=6, ge=1, description="启用回流监控时，下单遇库存不足连续冲刺多少次再回监控")
+    sold_out_burst_attempts: int = Field(
+        default=6,
+        ge=1,
+        description="回流监控触发后单轮下单冲刺上限，内部最多 6 次",
+    )
     return_monitor_enabled: bool = Field(default=False, description="是否启用回流票低频监控")
     monitor_interval_ms: int = Field(default=5000, ge=1000, description="回流票监控间隔（毫秒）")
     monitor_end_time: str = Field(default="", max_length=64, description="回流票监控截止时间，ISO 格式")

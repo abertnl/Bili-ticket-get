@@ -897,6 +897,53 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(grabber.status.rate_limit_count, 4)
         self.assertEqual(grabber.status.finished_reason, "达到最大尝试次数")
 
+    async def test_initial_burst_rate_limit_wall_records_telemetry_and_enters_monitoring(self) -> None:
+        config = self.make_config()
+        config.return_monitor_enabled = True
+        config.max_attempts = 10
+        config.monitor_end_time = self.future_time()
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "销售中", 1)],
+                )
+            ],
+        )
+        create_order = AsyncMock(return_value=ticket.CreateResult(code=429, message="HTTP 429"))
+        wait_for_return = AsyncMock(return_value=False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("app.grabber.TELEMETRY_DIR", Path(tmp)),
+                patch("app.grabber.BiliClient", FakeBiliClient),
+                patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+                patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+                patch("app.grabber.Grabber._wait_for_return_ticket", new=wait_for_return),
+                patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
+                patch("app.grabber.ticket.create_order", new=create_order),
+                patch("app.grabber.asyncio.sleep", new=AsyncMock()),
+            ):
+                await grabber._run()
+
+            payloads = [
+                json.loads(line)
+                for line in Path(grabber.status.telemetry_path).read_text(encoding="utf-8").splitlines()
+            ]
+
+        burst_finishes = [item for item in payloads if item["event"] == "burst_finish"]
+        self.assertEqual(create_order.await_count, 3)
+        wait_for_return.assert_awaited_once()
+        self.assertEqual(len(burst_finishes), 1)
+        self.assertEqual(burst_finishes[0]["outcome"], "rate_limit_wall")
+        self.assertEqual(burst_finishes[0]["burst_attempts"], 3)
+        self.assertEqual(burst_finishes[0]["burst_rate_limits"], 3)
+
     async def test_initialization_resolves_buyers_and_price_before_start_time(self) -> None:
         events: list[dict] = []
         config = self.make_config()
@@ -1224,7 +1271,7 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         ):
             await grabber._run()
 
-        self.assertEqual(prepare_order.await_count, 3)
+        self.assertEqual(prepare_order.await_count, 2)
         wait_for_return.assert_awaited_once()
 
     async def test_sold_out_after_return_monitor_goes_back_to_monitoring(self) -> None:
@@ -1261,11 +1308,12 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
                 "app.grabber.ticket.create_order",
                 new=AsyncMock(return_value=ticket.CreateResult(code=100009, message="库存不足")),
             ) as create_order,
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()),
         ):
             await grabber._run()
 
         self.assertEqual(wait_for_return.await_count, 2)
-        self.assertEqual(create_order.await_count, 4)
+        self.assertEqual(create_order.await_count, 3)
 
     async def test_return_monitor_runs_initial_burst_before_monitoring(self) -> None:
         config = self.make_config()
@@ -1300,9 +1348,9 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         ):
             await grabber._run()
 
-        self.assertEqual(create_order.await_count, 3)
+        self.assertEqual(create_order.await_count, 2)
         wait_for_return.assert_awaited_once()
-        self.assertEqual(grabber.status.sold_out_count, 3)
+        self.assertEqual(grabber.status.sold_out_count, 2)
 
     def test_aimd_backs_off_on_rate_limit_and_speeds_up_on_retry(self) -> None:
         config = self.make_config()
@@ -1317,10 +1365,20 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(grabber._dynamic_interval, 2.0)
         self.assertEqual(grabber.status.rate_limit_count, 2)
         self.assertEqual(grabber.status.consecutive_rate_limits, 2)
+        self.assertEqual(grabber._rate_limit_recovery_remaining, 10)
 
         grabber._on_retryable()
-        self.assertAlmostEqual(grabber._dynamic_interval, 1.95)
+        self.assertAlmostEqual(grabber._dynamic_interval, 2.0)
         self.assertEqual(grabber.status.consecutive_rate_limits, 0)
+        self.assertEqual(grabber._rate_limit_recovery_remaining, 9)
+
+        for _ in range(9):
+            grabber._on_retryable()
+        self.assertAlmostEqual(grabber._dynamic_interval, 2.0)
+        self.assertEqual(grabber._rate_limit_recovery_remaining, 0)
+
+        grabber._on_retryable()
+        self.assertAlmostEqual(grabber._dynamic_interval, 1.975)
 
         for _ in range(200):
             grabber._on_retryable()
@@ -1373,9 +1431,9 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         ):
             await grabber._run()
 
-        self.assertEqual(create_order.await_count, 6)
+        self.assertEqual(create_order.await_count, 3)
         self.assertEqual(wait_for_return.await_count, 2)
-        self.assertEqual(grabber.status.sold_out_count, 6)
+        self.assertEqual(grabber.status.sold_out_count, 3)
 
     async def test_prewarm_resolution_retries_transient_failure(self) -> None:
         config = self.make_config()
