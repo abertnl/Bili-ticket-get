@@ -128,6 +128,7 @@ class AppConfig(BaseModel):
         description="回流监控触发后单轮下单冲刺上限，内部最多 6 次",
     )
     return_monitor_enabled: bool = Field(default=False, description="是否启用回流票低频监控")
+    return_monitor_sku_ids: list[int] = Field(default_factory=list, description="回流票监控候选票档 ID 列表")
     monitor_interval_ms: int = Field(default=5000, ge=1000, description="回流票监控间隔（毫秒）")
     monitor_end_time: str = Field(default="", max_length=64, description="回流票监控截止时间，ISO 格式")
 
@@ -152,6 +153,13 @@ class AppConfig(BaseModel):
         if value and not re.fullmatch(r"1[0-9]{10}", value):
             raise ValueError("联系人手机号必须是 11 位手机号")
         return value
+
+    @field_validator("return_monitor_sku_ids")
+    @classmethod
+    def validate_return_monitor_sku_ids(cls, value: list[int]) -> list[int]:
+        if any(sku_id <= 0 for sku_id in value):
+            raise ValueError("return_monitor_sku_ids 必须是正整数")
+        return list(dict.fromkeys(value))
 
 
 def load_config(path: Path | None = None) -> AppConfig:

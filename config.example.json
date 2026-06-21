@@ -22,6 +22,7 @@
   "payment_link_enabled": true,
   "sold_out_burst_attempts": 6,
   "return_monitor_enabled": false,
+  "return_monitor_sku_ids": [],
   "monitor_interval_ms": 5000,
   "monitor_end_time": "",
   "captcha_mode": "manual",

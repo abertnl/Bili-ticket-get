@@ -57,6 +57,7 @@ uv run main.py
 | `cookie` | 登录 Cookie（SESSDATA / bili_jct / DedeUserID） | — |
 | `project_id` | 演出 ID | — |
 | `screen_id` / `sku_id` | 场次 / 票档 ID | — |
+| `return_monitor_sku_ids` | 回流票监控候选票档 ID 列表（同一场次内） | `[]` |
 | `buyer_ids` | 购票人 ID 列表 | `[]` |
 | `contact_name` / `contact_tel` | 联系人姓名 / 手机号（部分项目必填，留空使用首位购票人） | `""` |
 | `count` | 购买张数 | `1` |
@@ -71,8 +72,9 @@ uv run main.py
 | `notify.bark_url` | Bark 推送地址 | `""` |
 | `notify.serverchan_key` | Server 酱 Key | `""` |
 
-启用回流票监控时，默认策略会在开抢点先短冲刺；遇到连续限流或库存不足会回到低频监控，
-发现疑似可售后再进入小轮下单冲刺。
+启用回流票监控时，默认策略会在开抢点先对主票档短冲刺；遇到连续限流或库存不足会回到低频监控，
+并在同一场次内同时检查回流候选票档。发现多个疑似可售票档时，优先尝试库存数更多的候选；
+候选为空时保持兼容，只监控主票档。
 每次运行会在 `runtime/grab-runs/` 下写入一份 JSONL 复盘文件，该目录已被 git 忽略。
 
 ## 项目结构

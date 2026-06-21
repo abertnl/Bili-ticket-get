@@ -10,6 +10,8 @@ from typing import Any
 from .client import BiliClient
 
 BASE = "https://show.bilibili.com"
+MALL_BASE = "https://mall.bilibili.com"
+PROJECT_NEW_URL = f"{MALL_BASE}/mall-search-items/items_detail/info"
 PROJECT_URL = f"{BASE}/api/ticket/project/getV2"
 BUYER_LIST_URL = f"{BASE}/api/ticket/buyer/list"
 PREPARE_URL = f"{BASE}/api/ticket/order/prepare"
@@ -127,31 +129,153 @@ def _int_or_zero(value: Any) -> int:
         return 0
 
 
+SALE_FLAG_NUMBER_MAP: dict[int, str] = {
+    1: "不可售",
+    2: "预售",
+    3: "停售",
+    4: "售罄",
+    5: "不可用",
+    6: "库存紧张",
+    8: "暂时售罄",
+    9: "不在白名单",
+    101: "未开始",
+    102: "已结束",
+    103: "未完成",
+    105: "下架",
+    106: "已取消",
+}
+
+
+def _sale_flag_text(raw: Any, fallback_number: Any = None) -> str:
+    if isinstance(raw, dict):
+        for key in ("display_name", "name", "status_name", "desc"):
+            value = raw.get(key)
+            if value:
+                return str(value)
+        fallback_number = raw.get("number", fallback_number)
+    elif isinstance(raw, int):
+        fallback_number = raw
+    elif raw not in (None, ""):
+        return str(raw)
+
+    number = _int_or_zero(fallback_number)
+    return SALE_FLAG_NUMBER_MAP.get(number, "")
+
+
+def _parse_sku(raw: dict[str, Any]) -> TicketSku:
+    return TicketSku(
+        sku_id=_int_or_zero(raw.get("id") or raw.get("sku_id") or raw.get("skuId")),
+        desc=str(raw.get("desc", "") or raw.get("name", "") or raw.get("screenName", "")),
+        price=_int_or_zero(raw.get("price") or raw.get("originPrice")),
+        sale_flag=_sale_flag_text(
+            raw.get("sale_flag") or raw.get("saleFlag"),
+            raw.get("sale_flag_number") or raw.get("saleFlagNumber"),
+        ),
+        num=_int_or_zero(raw.get("num") or raw.get("stock") or raw.get("stockNum")),
+    )
+
+
+def _project_from_payload(project_id: int, data: dict[str, Any]) -> Project:
+    screens: list[Screen] = []
+    for s in data.get("screen_list", []):
+        if not isinstance(s, dict):
+            continue
+        skus = [_parse_sku(t) for t in s.get("ticket_list", []) if isinstance(t, dict)]
+        screens.append(
+            Screen(
+                screen_id=_int_or_zero(s.get("id") or s.get("screen_id") or s.get("screenId")),
+                name=str(s.get("name", "")),
+                skus=skus,
+            )
+        )
+    return Project(
+        project_id=_int_or_zero(data.get("id") or data.get("project_id") or project_id),
+        name=str(data.get("name", "") or data.get("projectName", "")),
+        screens=screens,
+        raw=data,
+    )
+
+
+def _normalize_new_project_payload(data: dict[str, Any], project_id: int) -> dict[str, Any]:
+    normalized_project_id = _int_or_zero(data.get("projectId") or data.get("itemsId") or project_id)
+    screens = data.get("screenList", [])
+    if not isinstance(screens, list) or not screens:
+        raise RuntimeError("新版演出信息缺少场次列表")
+
+    normalized_screens: list[dict[str, Any]] = []
+    for screen in screens:
+        if not isinstance(screen, dict):
+            continue
+        screen_copy = dict(screen)
+        screen_copy.setdefault("project_id", normalized_project_id)
+        tickets: list[dict[str, Any]] = []
+        ticket_list = screen_copy.get("ticket_list") or screen_copy.get("ticketList") or []
+        for ticket_item in ticket_list:
+            if not isinstance(ticket_item, dict):
+                continue
+            ticket_copy = dict(ticket_item)
+            ticket_copy.setdefault("project_id", normalized_project_id)
+            ticket_copy.setdefault("screen_name", screen_copy.get("name", ""))
+            sale_flag = ticket_copy.get("sale_flag") or ticket_copy.get("saleFlag") or {}
+            if isinstance(sale_flag, dict):
+                ticket_copy.setdefault("sale_flag_number", sale_flag.get("number"))
+            tickets.append(ticket_copy)
+        screen_copy["ticket_list"] = tickets
+        normalized_screens.append(screen_copy)
+
+    return {
+        "id": normalized_project_id,
+        "name": data.get("projectName", ""),
+        "hotProject": bool(data.get("hotProject", False)),
+        "screen_list": normalized_screens,
+        "sales_dates": data.get("salesDates", []) if isinstance(data.get("salesDates"), list) else [],
+        "start_time": data.get("startTime") or data.get("start_time") or 0,
+        "end_time": data.get("endTime") or 0,
+    }
+
+
+async def _get_project_new(client: BiliClient, project_id: int) -> Project:
+    data = await client.post_json(
+        PROJECT_NEW_URL,
+        json={"itemsId": project_id, "itemsDetailPageType": 3},
+        headers={
+            "Origin": MALL_BASE,
+            "Referer": (
+                f"{MALL_BASE}/neul-next/ticket-renovation/detail.html"
+                f"?id={project_id}&from=pc_ticketlist&noTitleBar=1"
+            ),
+        },
+    )
+    code = data.get("code", data.get("errno"))
+    if data.get("success") is False or code not in (None, 0):
+        raise RuntimeError(data.get("message") or data.get("msg") or "新版演出信息加载失败")
+    inner = data.get("data")
+    if not isinstance(inner, dict):
+        raise RuntimeError("新版演出信息为空")
+    return _project_from_payload(project_id, _normalize_new_project_payload(inner, project_id))
+
+
+async def _get_project_old(client: BiliClient, project_id: int) -> Project:
+    data = await client.get_json(PROJECT_URL, params={"version": 134, "id": project_id, "project_id": project_id})
+    if data.get("code", data.get("errno", 0)) != 0:
+        raise RuntimeError(f"获取演出信息失败: {data.get('msg') or data.get('message')}")
+    d = data["data"]
+    return _project_from_payload(project_id, d)
+
+
 async def get_project(client: BiliClient, project_id: int) -> Project:
     """拉取演出信息（场次 + 票档）。"""
 
-    data = await client.get_json(PROJECT_URL, params={"id": project_id, "project_id": project_id})
-    if data.get("code") != 0:
-        raise RuntimeError(f"获取演出信息失败: {data.get('msg') or data.get('message')}")
-    d = data["data"]
-    screens: list[Screen] = []
-    for s in d.get("screen_list", []):
-        skus = [
-            TicketSku(
-                sku_id=t.get("id", 0),
-                desc=t.get("desc", ""),
-                price=t.get("price", 0),
-                sale_flag=(
-                    t.get("sale_flag", {}).get("display_name", "")
-                    if isinstance(t.get("sale_flag"), dict)
-                    else str(t.get("sale_flag", ""))
-                ),
-                num=t.get("num", 0),
-            )
-            for t in s.get("ticket_list", [])
-        ]
-        screens.append(Screen(screen_id=s.get("id", 0), name=s.get("name", ""), skus=skus))
-    return Project(project_id=project_id, name=d.get("name", ""), screens=screens, raw=d)
+    try:
+        return await _get_project_new(client, project_id)
+    except Exception as new_error:  # noqa: BLE001
+        try:
+            return await _get_project_old(client, project_id)
+        except Exception as old_error:  # noqa: BLE001
+            raise RuntimeError(
+                "获取演出信息失败: "
+                f"新版接口={new_error}; 旧版接口={old_error}"
+            ) from old_error
 
 
 async def get_buyers(client: BiliClient) -> list[Buyer]:
