@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import time
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -20,7 +21,7 @@ from app.bili import auth, ticket
 from app.bili.client import BiliClient
 from app.bili.errors import ResultKind, classify
 from app.config import AppConfig, NotifyConfig, ServerConfig
-from app.grabber import AttemptOutcome, Grabber, _has_pending_order
+from app.grabber import AttemptOutcome, Grabber, TicketTarget, _has_pending_order
 
 
 def load_entrypoint_module():
@@ -263,6 +264,17 @@ class ServerConfigTests(unittest.TestCase):
         self.assertEqual(server.state.config.notify.serverchan_key, "SCT-secret")
         self.assertEqual(server.state.config.notify.imessage_recipient, "+15555550123")
 
+    def test_return_monitor_sku_ids_round_trip_through_config(self) -> None:
+        with patch("app.server.save_config"):
+            response = self.client.post(
+                "/api/config",
+                json={"return_monitor_sku_ids": [301, 302, 301]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(server.state.config.return_monitor_sku_ids, [301, 302])
+        self.assertEqual(response.json()["config"]["return_monitor_sku_ids"], [301, 302])
+
     def test_config_rejects_invalid_values(self) -> None:
         cases = [
             {"count": 0},
@@ -275,6 +287,7 @@ class ServerConfigTests(unittest.TestCase):
             {"monitor_interval_ms": 999},
             {"captcha_mode": "bad"},
             {"buyer_ids": [1, 0]},
+            {"return_monitor_sku_ids": [300, 0]},
             {"notify": {"bark_url": "http://api.day.app/bark-secret"}},
             {"notify": {"bark_url": "https://127.0.0.1/bark-secret"}},
             {"notify": {"serverchan_key": "../SCT-secret"}},
@@ -897,6 +910,53 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(grabber.status.rate_limit_count, 4)
         self.assertEqual(grabber.status.finished_reason, "达到最大尝试次数")
 
+    async def test_initial_burst_rate_limit_wall_records_telemetry_and_enters_monitoring(self) -> None:
+        config = self.make_config()
+        config.return_monitor_enabled = True
+        config.max_attempts = 10
+        config.monitor_end_time = self.future_time()
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[ticket.TicketSku(300, "vip", 8800, "销售中", 1)],
+                )
+            ],
+        )
+        create_order = AsyncMock(return_value=ticket.CreateResult(code=429, message="HTTP 429"))
+        wait_for_return = AsyncMock(return_value=False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("app.grabber.TELEMETRY_DIR", Path(tmp)),
+                patch("app.grabber.BiliClient", FakeBiliClient),
+                patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+                patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+                patch("app.grabber.Grabber._wait_for_return_ticket", new=wait_for_return),
+                patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
+                patch("app.grabber.ticket.create_order", new=create_order),
+                patch("app.grabber.asyncio.sleep", new=AsyncMock()),
+            ):
+                await grabber._run()
+
+            payloads = [
+                json.loads(line)
+                for line in Path(grabber.status.telemetry_path).read_text(encoding="utf-8").splitlines()
+            ]
+
+        burst_finishes = [item for item in payloads if item["event"] == "burst_finish"]
+        self.assertEqual(create_order.await_count, 3)
+        wait_for_return.assert_awaited_once()
+        self.assertEqual(len(burst_finishes), 1)
+        self.assertEqual(burst_finishes[0]["outcome"], "rate_limit_wall")
+        self.assertEqual(burst_finishes[0]["burst_attempts"], 3)
+        self.assertEqual(burst_finishes[0]["burst_rate_limits"], 3)
+
     async def test_initialization_resolves_buyers_and_price_before_start_time(self) -> None:
         events: list[dict] = []
         config = self.make_config()
@@ -1179,6 +1239,78 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(grabber._sku_looks_available(ticket.TicketSku(300, "vip", 8800, "已售罄", 0)))
         self.assertFalse(grabber._sku_looks_available(ticket.TicketSku(300, "vip", 8800, "暂未开售", 0)))
 
+    async def test_return_monitor_selects_highest_stock_candidate(self) -> None:
+        config = self.make_config()
+        config.return_monitor_enabled = True
+        config.return_monitor_sku_ids = [301, 302]
+        config.monitor_end_time = self.future_time()
+        grabber = Grabber(config)
+        grabber._client = FakeBiliClient(config.cookie)
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[
+                        ticket.TicketSku(300, "primary", 8800, "已售罄", 0),
+                        ticket.TicketSku(301, "balcony", 6800, "销售中", 1),
+                        ticket.TicketSku(302, "vip", 9800, "销售中", 4),
+                    ],
+                )
+            ],
+        )
+
+        with patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)):
+            targets = await grabber._wait_for_return_ticket(
+                datetime.now().astimezone() + timedelta(minutes=5)
+            )
+
+        self.assertEqual([target.sku_id for target in targets], [302, 301])
+        self.assertEqual(grabber.status.monitor_target_count, 3)
+        self.assertIn("primary", grabber.status.last_monitor_candidates)
+
+    def test_return_monitor_ties_use_configured_order(self) -> None:
+        config = self.make_config()
+        config.return_monitor_sku_ids = [302, 301]
+        grabber = Grabber(config)
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[
+                        ticket.TicketSku(300, "primary", 8800, "已售罄", 0),
+                        ticket.TicketSku(301, "balcony", 6800, "销售中", 2),
+                        ticket.TicketSku(302, "vip", 9800, "销售中", 2),
+                    ],
+                )
+            ],
+        )
+
+        targets = grabber._available_monitor_targets(project)
+
+        self.assertEqual([target.sku_id for target in targets], [302, 301])
+
+    def test_prepare_token_cache_is_scoped_to_sku(self) -> None:
+        grabber = Grabber(self.make_config())
+        grabber._cached_token = "token-301"
+        grabber._cached_ptoken = "ptoken"
+        grabber._cached_token_at = time.perf_counter()
+        grabber._cached_token_sku_id = 301
+
+        self.assertEqual(
+            grabber._reusable_token(TicketTarget(200, 301, "balcony", 6800)),
+            "token-301",
+        )
+        self.assertEqual(
+            grabber._reusable_token(TicketTarget(200, 302, "vip", 9800)),
+            "",
+        )
+
     async def test_return_monitor_requires_future_end_time(self) -> None:
         config = self.make_config()
         config.return_monitor_enabled = True
@@ -1224,7 +1356,7 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         ):
             await grabber._run()
 
-        self.assertEqual(prepare_order.await_count, 3)
+        self.assertEqual(prepare_order.await_count, 2)
         wait_for_return.assert_awaited_once()
 
     async def test_sold_out_after_return_monitor_goes_back_to_monitoring(self) -> None:
@@ -1261,11 +1393,138 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
                 "app.grabber.ticket.create_order",
                 new=AsyncMock(return_value=ticket.CreateResult(code=100009, message="库存不足")),
             ) as create_order,
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()),
         ):
             await grabber._run()
 
         self.assertEqual(wait_for_return.await_count, 2)
-        self.assertEqual(create_order.await_count, 4)
+        self.assertEqual(create_order.await_count, 3)
+
+    async def test_return_burst_falls_back_to_next_available_candidate(self) -> None:
+        config = self.make_config()
+        config.return_monitor_enabled = True
+        config.sold_out_burst_attempts = 1
+        config.max_attempts = 6
+        config.monitor_end_time = self.future_time()
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[
+                        ticket.TicketSku(300, "primary", 8800, "销售中", 1),
+                        ticket.TicketSku(301, "balcony", 6800, "销售中", 1),
+                        ticket.TicketSku(302, "vip", 9800, "销售中", 2),
+                    ],
+                )
+            ],
+        )
+        return_targets = [
+            TicketTarget(200, 301, "balcony", 6800, "销售中", 1, 0),
+            TicketTarget(200, 302, "vip", 9800, "销售中", 2, 1),
+        ]
+        wait_for_return = AsyncMock(return_value=return_targets)
+
+        async def create_side_effect(*args, **kwargs):
+            sku_id = args[3]
+            if sku_id == 302:
+                return ticket.CreateResult(code=0, message="下单成功", order_id="ORDER302")
+            return ticket.CreateResult(code=100009, message="库存不足")
+
+        create_order = AsyncMock(side_effect=create_side_effect)
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
+            patch("app.grabber.Grabber._wait_for_return_ticket", new=wait_for_return),
+            patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
+            patch("app.grabber.ticket.create_order", new=create_order),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()),
+        ):
+            await grabber._run()
+
+        attempted_skus = [call.args[3] for call in create_order.await_args_list]
+        self.assertEqual(attempted_skus[-2:], [301, 302])
+        wait_for_return.assert_awaited_once()
+        self.assertTrue(grabber.status.success)
+        self.assertEqual(grabber.status.order_id, "ORDER302")
+
+    async def test_return_burst_refreshes_candidates_after_100001(self) -> None:
+        config = self.make_config()
+        config.return_monitor_enabled = True
+        config.return_monitor_sku_ids = [301, 302]
+        config.sold_out_burst_attempts = 1
+        config.max_attempts = 6
+        config.monitor_end_time = self.future_time()
+        grabber = Grabber(config)
+        buyers = [ticket.Buyer(buyer_id=1, name="Alice", tel="1", id_card="id")]
+        initial_project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[
+                        ticket.TicketSku(300, "primary", 8800, "销售中", 1),
+                        ticket.TicketSku(301, "balcony", 6800, "销售中", 1),
+                        ticket.TicketSku(302, "vip", 9800, "已售罄", 0),
+                    ],
+                )
+            ],
+        )
+        refreshed_project = ticket.Project(
+            project_id=100,
+            name="show",
+            screens=[
+                ticket.Screen(
+                    screen_id=200,
+                    name="screen",
+                    skus=[
+                        ticket.TicketSku(300, "primary", 8800, "已售罄", 0),
+                        ticket.TicketSku(301, "balcony", 6800, "已售罄", 0),
+                        ticket.TicketSku(302, "vip", 9800, "销售中", 5),
+                    ],
+                )
+            ],
+        )
+        wait_for_return = AsyncMock(
+            return_value=[TicketTarget(200, 301, "balcony", 6800, "销售中", 1, 0)]
+        )
+
+        async def create_side_effect(*args, **kwargs):
+            sku_id = args[3]
+            if sku_id == 301:
+                return ticket.CreateResult(code=100001, message="暂无可售票")
+            if sku_id == 302:
+                return ticket.CreateResult(code=0, message="下单成功", order_id="ORDER302")
+            return ticket.CreateResult(code=100009, message="库存不足")
+
+        create_order = AsyncMock(side_effect=create_side_effect)
+
+        with (
+            patch("app.grabber.BiliClient", FakeBiliClient),
+            patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
+            patch(
+                "app.grabber.ticket.get_project",
+                new=AsyncMock(side_effect=[initial_project, refreshed_project]),
+            ),
+            patch("app.grabber.Grabber._wait_for_return_ticket", new=wait_for_return),
+            patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
+            patch("app.grabber.ticket.create_order", new=create_order),
+            patch("app.grabber.asyncio.sleep", new=AsyncMock()),
+        ):
+            await grabber._run()
+
+        attempted_skus = [call.args[3] for call in create_order.await_args_list]
+        self.assertIn(301, attempted_skus)
+        self.assertEqual(attempted_skus[-1], 302)
+        self.assertTrue(grabber.status.success)
 
     async def test_return_monitor_runs_initial_burst_before_monitoring(self) -> None:
         config = self.make_config()
@@ -1300,9 +1559,9 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         ):
             await grabber._run()
 
-        self.assertEqual(create_order.await_count, 3)
+        self.assertEqual(create_order.await_count, 2)
         wait_for_return.assert_awaited_once()
-        self.assertEqual(grabber.status.sold_out_count, 3)
+        self.assertEqual(grabber.status.sold_out_count, 2)
 
     def test_aimd_backs_off_on_rate_limit_and_speeds_up_on_retry(self) -> None:
         config = self.make_config()
@@ -1317,10 +1576,20 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(grabber._dynamic_interval, 2.0)
         self.assertEqual(grabber.status.rate_limit_count, 2)
         self.assertEqual(grabber.status.consecutive_rate_limits, 2)
+        self.assertEqual(grabber._rate_limit_recovery_remaining, 10)
 
         grabber._on_retryable()
-        self.assertAlmostEqual(grabber._dynamic_interval, 1.95)
+        self.assertAlmostEqual(grabber._dynamic_interval, 2.0)
         self.assertEqual(grabber.status.consecutive_rate_limits, 0)
+        self.assertEqual(grabber._rate_limit_recovery_remaining, 9)
+
+        for _ in range(9):
+            grabber._on_retryable()
+        self.assertAlmostEqual(grabber._dynamic_interval, 2.0)
+        self.assertEqual(grabber._rate_limit_recovery_remaining, 0)
+
+        grabber._on_retryable()
+        self.assertAlmostEqual(grabber._dynamic_interval, 1.975)
 
         for _ in range(200):
             grabber._on_retryable()
@@ -1373,9 +1642,9 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
         ):
             await grabber._run()
 
-        self.assertEqual(create_order.await_count, 6)
+        self.assertEqual(create_order.await_count, 5)
         self.assertEqual(wait_for_return.await_count, 2)
-        self.assertEqual(grabber.status.sold_out_count, 6)
+        self.assertEqual(grabber.status.sold_out_count, 5)
 
     async def test_prewarm_resolution_retries_transient_failure(self) -> None:
         config = self.make_config()
@@ -1627,6 +1896,82 @@ class _FakeResponse:
 
 
 class TicketPayloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_project_uses_new_detail_endpoint_with_stock_count(self) -> None:
+        class FakeTicketClient:
+            def __init__(self) -> None:
+                self.post_json = AsyncMock(
+                    return_value={
+                        "code": 0,
+                        "data": {
+                            "projectId": 100,
+                            "projectName": "show",
+                            "screenList": [
+                                {
+                                    "screenId": 200,
+                                    "name": "screen",
+                                    "ticketList": [
+                                        {
+                                            "skuId": 300,
+                                            "desc": "vip",
+                                            "price": 8800,
+                                            "saleFlag": {"display_name": "销售中", "number": 6},
+                                            "stockNum": 5,
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    }
+                )
+                self.get_json = AsyncMock()
+
+        client = FakeTicketClient()
+
+        project = await ticket.get_project(client, 100)  # type: ignore[arg-type]
+
+        self.assertEqual(project.project_id, 100)
+        self.assertEqual(project.name, "show")
+        self.assertEqual(project.screens[0].skus[0].sku_id, 300)
+        self.assertEqual(project.screens[0].skus[0].num, 5)
+        client.get_json.assert_not_awaited()
+
+    async def test_get_project_falls_back_to_old_detail_endpoint(self) -> None:
+        class FakeTicketClient:
+            def __init__(self) -> None:
+                self.post_json = AsyncMock(side_effect=RuntimeError("new down"))
+                self.get_json = AsyncMock(
+                    return_value={
+                        "code": 0,
+                        "data": {
+                            "id": 100,
+                            "name": "show",
+                            "screen_list": [
+                                {
+                                    "id": 200,
+                                    "name": "screen",
+                                    "ticket_list": [
+                                        {
+                                            "id": 300,
+                                            "desc": "vip",
+                                            "price": 8800,
+                                            "sale_flag": 4,
+                                            "num": 0,
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    }
+                )
+
+        client = FakeTicketClient()
+
+        project = await ticket.get_project(client, 100)  # type: ignore[arg-type]
+
+        self.assertEqual(project.screens[0].skus[0].sale_flag, "售罄")
+        self.assertEqual(project.screens[0].skus[0].num, 0)
+        client.get_json.assert_awaited_once()
+
     async def test_prepare_order_includes_request_limit_hint_and_parses_ptoken(self) -> None:
         class FakeTicketClient:
             csrf = "csrf-token"

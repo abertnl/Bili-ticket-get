@@ -123,6 +123,7 @@ class ConfigUpdate(BaseModel):
     payment_link_enabled: bool | None = None
     sold_out_burst_attempts: int | None = Field(default=None, ge=1)
     return_monitor_enabled: bool | None = None
+    return_monitor_sku_ids: list[int] | None = None
     monitor_interval_ms: int | None = Field(default=None, ge=1000)
     monitor_end_time: str | None = Field(default=None, max_length=64)
     captcha_mode: Literal["manual", "rrocr"] | None = None
@@ -134,6 +135,13 @@ class ConfigUpdate(BaseModel):
     def validate_buyer_ids(cls, value: list[int] | None) -> list[int] | None:
         if value is not None and any(buyer_id <= 0 for buyer_id in value):
             raise ValueError("buyer_ids 必须是正整数")
+        return value
+
+    @field_validator("return_monitor_sku_ids")
+    @classmethod
+    def validate_return_monitor_sku_ids(cls, value: list[int] | None) -> list[int] | None:
+        if value is not None and any(sku_id <= 0 for sku_id in value):
+            raise ValueError("return_monitor_sku_ids 必须是正整数")
         return value
 
 
@@ -505,6 +513,7 @@ async def get_project(project_id: int = Query(ge=1)) -> Any:
                         "desc": k.desc,
                         "price": k.price,
                         "sale_flag": k.sale_flag,
+                        "num": k.num,
                     }
                     for k in s.skus
                 ],
@@ -589,6 +598,10 @@ async def grab_report() -> dict[str, Any]:
             "time_offset_ms": 0,
             "prewarm_ok": False,
             "transport": "",
+            "target_sku_id": 0,
+            "target_sku_desc": "",
+            "monitor_target_count": 0,
+            "last_monitor_candidates": "",
             "elapsed_ms": 0,
         }
     return state.grabber.report()

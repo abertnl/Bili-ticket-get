@@ -64,6 +64,12 @@
         <div class="row">
           <label>票档</label>
           <select id="skuSelect"></select>
+          <p class="field-hint">首发开抢只使用此票档。</p>
+        </div>
+        <div class="row">
+          <label>回流候选票档</label>
+          <div id="returnSkuList" class="sku-candidate-list"></div>
+          <p class="field-hint">启用回流票监控后同时监测这些票档；首发票档会自动作为兜底候选。</p>
         </div>
       </div>
 
@@ -128,7 +134,9 @@
           <div class="row">
             <label>库存不足连冲次数</label>
             <input type="number" id="soldOutBurstInput" min="1" value="6" />
-            <p class="field-hint">下单遇库存不足时连续冲刺多少次再回到回流监控。</p>
+            <p class="field-hint">
+              回流监控发现疑似可售后单轮最多冲刺次数；库存不足会提前回监控。
+            </p>
           </div>
           <div class="row">
             <label>监控截止时间</label>
@@ -173,6 +181,8 @@
             <div class="stat"><span class="num" id="statSoldOut">0</span><span class="lbl">售罄次数</span></div>
             <div class="stat"><span class="num" id="statDynamicInterval">0ms</span><span class="lbl">当前间隔</span></div>
             <div class="stat"><span class="num" id="statEffectiveOrders">0</span><span class="lbl">有效下单</span></div>
+            <div class="stat stat-wide"><span class="num path" id="statTargetSku">-</span><span class="lbl">当前票档</span></div>
+            <div class="stat"><span class="num" id="statMonitorTargets">0</span><span class="lbl">候选票档</span></div>
             <div class="stat"><span class="num" id="statPhase">idle</span><span class="lbl">策略阶段</span></div>
             <div class="stat"><span class="num" id="statTimeOffset">0ms</span><span class="lbl">时间偏移</span></div>
             <div class="stat"><span class="num" id="statPrewarm">-</span><span class="lbl">连接预热</span></div>

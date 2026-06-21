@@ -106,13 +106,16 @@ textarea { resize: vertical; }
 .qr-status { font-size: 13px; color: var(--muted); min-height: 18px; }
 
 .project-info { font-size: 14px; margin-bottom: 14px; color: var(--text); }
-.buyer-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.buyer-list,
+.sku-candidate-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
 .buyer-item {
   display: flex; align-items: center; gap: 8px;
   background: var(--card2); border: 1px solid var(--line);
   padding: 10px 12px; border-radius: 8px; font-size: 14px; cursor: pointer;
 }
 .buyer-item input { width: auto; }
+.sku-candidate-list .buyer-item { align-items: flex-start; line-height: 1.35; }
+.sku-candidate-list .meta { color: var(--muted); font-size: 12px; }
 .contact-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
