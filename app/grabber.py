@@ -4,220 +4,38 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from enum import Enum
-import json
+from datetime import datetime
 from pathlib import Path
-import re
-import time
 from typing import Any
-from uuid import uuid4
 
-from . import notify
+from . import grab_targets
+# 现有测试通过 ``app.grabber.notify`` 定位推送模块，保留该导入入口。
+from . import notify  # noqa: F401
 from .bili import ticket
 from .bili.captcha import ManualSolver, build_solver
 from .bili.client import BiliClient
-from .bili.errors import ResultKind, classify, describe
+from .bili.errors import ResultKind
 from .bili.risk import RiskError, RiskHandler
 from .config import AppConfig
+from .grab_clock import GrabClock
+from .grab_context import GrabContext
+from .grab_monitor import ReturnTicketMonitor
+from .grab_order import OrderExecutor
+from .grab_models import AttemptOutcome, AttemptResult, BurstDecision, BurstState, GrabPhase, GrabberStatus, TicketTarget
+from .grab_pacing import PacingController, PrepareTokenCache
+from .grab_strategy import BalancedStrategyController
+from .grab_reporting import RunRecorder
+
+# 保持原有类型导入入口。
+__all__ = [
+    "Grabber", "GrabPhase", "GrabberStatus", "AttemptOutcome", "AttemptResult",
+    "BurstDecision", "BurstState", "TicketTarget", "BalancedStrategyController",
+]
 
 # 日志事件回调：接收一个 dict 事件（type/level/message/...）
 EventCallback = Callable[[dict[str, Any]], None]
 
-# prepare token 最长复用时长（秒）：仅在拥堵可重试时短时复用，减半请求量
-_TOKEN_REUSE_SECONDS = 2.5
-# 连续触发限流后进入更长冷却。短间隔会把同一账号/IP持续压在 429 窗口里。
-_RATE_LIMIT_COOLDOWN_AFTER = 3
-_RATE_LIMIT_COOLDOWN_MAX_SECONDS = 30.0
-_RATE_LIMIT_RECOVERY_RESPONSES = 10
-_CONGESTION_DECREASE_SECONDS = 0.025
-_INITIAL_BURST_ATTEMPTS = 24
-_INITIAL_BURST_RATE_LIMITS = 3
-_INITIAL_BURST_SOLD_OUTS = 2
-_RETURN_BURST_ATTEMPTS = 6
-_RETURN_BURST_RATE_LIMITS = 2
-_RETURN_BURST_SOLD_OUTS = 1
 TELEMETRY_DIR = Path("runtime/grab-runs")
-
-
-class GrabPhase(str, Enum):
-    """自动平衡策略的运行阶段，用于调节节奏和复盘。"""
-
-    IDLE = "idle"
-    PREWARM = "prewarm"
-    START_WAIT = "start_wait"
-    START_BURST = "start_burst"
-    CONGESTION_RETRY = "congestion_retry"
-    RATE_LIMIT_COOLDOWN = "rate_limit_cooldown"
-    SOLD_OUT_MONITOR = "sold_out_monitor"
-    RETURN_BURST = "return_burst"
-    CAPTCHA = "captcha"
-    FINISHED = "finished"
-
-
-@dataclass
-class BurstDecision:
-    """当前 burst 是否应该结束，以及复盘需要的计数。"""
-
-    finished: bool = False
-    reason: str = ""
-    burst_attempts: int = 0
-    burst_rate_limits: int = 0
-    burst_sold_outs: int = 0
-
-
-@dataclass
-class BurstState:
-    """一轮冲刺的限额和已发生结果。"""
-
-    phase: GrabPhase
-    max_create_attempts: int
-    max_rate_limits: int
-    max_sold_outs: int
-    create_attempts: int = 0
-    rate_limits: int = 0
-    sold_outs: int = 0
-
-
-class BalancedStrategyController:
-    """单账号自动平衡策略：首发先短冲刺，回流阶段少撞限流。"""
-
-    def __init__(self) -> None:
-        self.phase = GrabPhase.IDLE
-        self.burst: BurstState | None = None
-
-    def set_phase(self, phase: GrabPhase) -> GrabPhase:
-        self.phase = phase
-        return phase
-
-    def start_burst(self, phase: GrabPhase, configured_return_attempts: int) -> None:
-        self.phase = phase
-        if phase is GrabPhase.RETURN_BURST:
-            max_attempts = max(1, min(configured_return_attempts, _RETURN_BURST_ATTEMPTS))
-            self.burst = BurstState(
-                phase=phase,
-                max_create_attempts=max_attempts,
-                max_rate_limits=_RETURN_BURST_RATE_LIMITS,
-                max_sold_outs=max_attempts,
-            )
-            return
-
-        self.burst = BurstState(
-            phase=phase,
-            max_create_attempts=_INITIAL_BURST_ATTEMPTS,
-            max_rate_limits=_INITIAL_BURST_RATE_LIMITS,
-            max_sold_outs=_INITIAL_BURST_SOLD_OUTS,
-        )
-
-    def record_attempt(self, result: AttemptResult) -> BurstDecision:
-        if self.burst is None:
-            return BurstDecision()
-
-        if result.endpoint == "create":
-            self.burst.create_attempts += 1
-        if result.kind is ResultKind.RATE_LIMIT:
-            self.burst.rate_limits += 1
-        if result.outcome is AttemptOutcome.SOLD_OUT or result.kind is ResultKind.SOLD_OUT:
-            self.burst.sold_outs += 1
-
-        reason = ""
-        if self.burst.rate_limits >= self.burst.max_rate_limits:
-            reason = "rate_limit_wall"
-        elif self.burst.sold_outs >= self.burst.max_sold_outs:
-            reason = "sold_out_wall"
-        elif self.burst.create_attempts >= self.burst.max_create_attempts:
-            reason = "attempt_wall"
-
-        decision = BurstDecision(
-            finished=bool(reason),
-            reason=reason,
-            burst_attempts=self.burst.create_attempts,
-            burst_rate_limits=self.burst.rate_limits,
-            burst_sold_outs=self.burst.sold_outs,
-        )
-        if reason:
-            self.burst = None
-        return decision
-
-
-class AttemptOutcome(str, Enum):
-    """一次下单尝试后的状态机动作。"""
-
-    RETRY = "retry"
-    SOLD_OUT = "sold_out"
-    STOP = "stop"
-
-
-@dataclass
-class AttemptResult:
-    """一次下单尝试后的状态机动作与下一次重试节奏。"""
-
-    outcome: AttemptOutcome
-    retry_delay: float = 0.0
-    retry_reason: str = ""
-    code: int | None = None
-    kind: ResultKind | None = None
-    endpoint: str = ""
-
-
-@dataclass
-class TicketTarget:
-    """本次尝试使用的票档快照。"""
-
-    screen_id: int
-    sku_id: int
-    desc: str
-    price: int
-    sale_flag: str = ""
-    num: int = 0
-    order: int = 0
-
-
-@dataclass
-class GrabberStatus:
-    """对外暴露的运行状态。"""
-
-    running: bool = False
-    attempts: int = 0
-    monitor_checks: int = 0
-    last_stock_status: str = ""
-    last_code: int | None = None
-    last_message: str = ""
-    last_prepare_ms: int = 0
-    last_create_ms: int = 0
-    last_attempt_ms: int = 0
-    avg_attempt_ms: int = 0
-    network_errors: int = 0
-    retry_reason: str = ""
-    retry_delay_ms: int = 0
-    success: bool = False
-    order_id: str = ""
-    payment_url: str = ""
-    pay_qrcode_url: str = ""
-    waiting_captcha: bool = False
-    finished_reason: str = ""
-    congestion_count: int = 0
-    rate_limit_count: int = 0
-    sold_out_count: int = 0
-    consecutive_rate_limits: int = 0
-    dynamic_interval_ms: int = 0
-    phase: str = GrabPhase.IDLE.value
-    run_id: str = ""
-    telemetry_path: str = ""
-    effective_delay_ms: int = 0
-    last_endpoint: str = ""
-    effective_order_attempts: int = 0
-    time_offset_ms: int = 0
-    prewarm_ok: bool = False
-    transport: str = ""
-    target_sku_id: int = 0
-    target_sku_desc: str = ""
-    monitor_target_count: int = 0
-    last_monitor_candidates: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return self.__dict__.copy()
 
 
 class Grabber:
@@ -226,26 +44,10 @@ class Grabber:
     def __init__(self, config: AppConfig, on_event: EventCallback | None = None) -> None:
         self.config = config
         self.on_event = on_event or (lambda e: None)
-        self.status = GrabberStatus()
         self.solver = build_solver(config.captcha_mode, config.rrocr_token)
         self.risk = RiskHandler(self.solver)
-        self.strategy = BalancedStrategyController()
         self._task: asyncio.Task | None = None
-        self._client: BiliClient | None = None
-        self._attempt_ms_total = 0
-        self._consecutive_network_errors = 0
-        self._dynamic_interval = self._interval_seconds()
-        self._cached_token = ""
-        self._cached_ptoken = ""
-        self._cached_token_at = 0.0
-        self._cached_token_sku_id = 0
-        self._telemetry_path: Path | None = None
-        self._run_started_at = 0.0
-        self._time_offset_seconds = 0.0
-        self._current_pay_money = 0
-        self._rate_limit_recovery_remaining = 0
-        self._primary_target: TicketTarget | None = None
-        self._last_project: ticket.Project | None = None
+        self._reset_run_state()
 
     # ---- 日志 ----
     def _emit(self, message: str, level: str = "info", **extra: Any) -> None:
@@ -262,106 +64,24 @@ class Grabber:
         self.on_event({"type": "status", **self.status.to_dict()})
 
     def _set_phase(self, phase: GrabPhase) -> None:
-        self.status.phase = self.strategy.set_phase(phase).value
+        self.status.phase = self.strategy.set_phase(phase)
 
     def _start_burst(self, phase: GrabPhase) -> None:
         self.strategy.start_burst(phase, self.config.sold_out_burst_attempts)
-        self.status.phase = phase.value
-
-    def _start_telemetry(self) -> None:
-        run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
-        self.status.run_id = run_id
-        self._telemetry_path = TELEMETRY_DIR / f"{run_id}.jsonl"
-        self.status.telemetry_path = str(self._telemetry_path)
-        self._run_started_at = time.perf_counter()
-        self._record_telemetry("run_start", outcome="running")
-
-    def _record_telemetry(
-        self,
-        event: str,
-        *,
-        endpoint: str = "",
-        attempt: int | None = None,
-        code: int | None = None,
-        kind: str = "",
-        delay_ms: int | None = None,
-        elapsed_ms: int | None = None,
-        stock_status: str = "",
-        outcome: str = "",
-        burst_attempts: int | None = None,
-        burst_rate_limits: int | None = None,
-        burst_sold_outs: int | None = None,
-    ) -> None:
-        if not self._telemetry_path:
-            return
-        payload: dict[str, Any] = {
-            "run_id": self.status.run_id,
-            "time": datetime.now().isoformat(timespec="milliseconds"),
-            "event": event,
-            "phase": self.status.phase,
-            "endpoint": endpoint,
-            "attempt": attempt,
-            "code": code,
-            "kind": kind,
-            "delay_ms": delay_ms,
-            "elapsed_ms": elapsed_ms,
-            "dynamic_interval_ms": self.status.dynamic_interval_ms,
-            "consecutive_rate_limits": self.status.consecutive_rate_limits,
-            "stock_status": stock_status,
-            "outcome": outcome,
-            "time_offset_ms": self.status.time_offset_ms,
-            "prewarm_ok": self.status.prewarm_ok,
-            "transport": self.status.transport,
-            "payment_url_present": bool(self.status.payment_url),
-            "target_sku_id": self.status.target_sku_id or None,
-            "target_sku_desc": self.status.target_sku_desc,
-            "monitor_target_count": self.status.monitor_target_count,
-            "monitor_candidates": self.status.last_monitor_candidates,
-        }
-        if burst_attempts is not None:
-            payload["burst_attempts"] = burst_attempts
-        if burst_rate_limits is not None:
-            payload["burst_rate_limits"] = burst_rate_limits
-        if burst_sold_outs is not None:
-            payload["burst_sold_outs"] = burst_sold_outs
-        try:
-            self._telemetry_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._telemetry_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
-        except OSError:
-            # 抢票流程优先，复盘文件写入失败不应中断下单。
-            return
+        self.status.phase = phase
 
     def report(self) -> dict[str, Any]:
-        elapsed_ms = 0
-        if self._run_started_at:
-            elapsed_ms = int(round((time.perf_counter() - self._run_started_at) * 1000))
-        return {
-            "run_id": self.status.run_id,
-            "phase": self.status.phase,
-            "running": self.status.running,
-            "success": self.status.success,
-            "finished_reason": self.status.finished_reason,
-            "attempts": self.status.attempts,
-            "monitor_checks": self.status.monitor_checks,
-            "effective_order_attempts": self.status.effective_order_attempts,
-            "rate_limit_count": self.status.rate_limit_count,
-            "congestion_count": self.status.congestion_count,
-            "sold_out_count": self.status.sold_out_count,
-            "network_errors": self.status.network_errors,
-            "telemetry_path": self.status.telemetry_path,
-            "order_id": self.status.order_id,
-            "payment_url": self.status.payment_url,
-            "pay_qrcode_url": self.status.pay_qrcode_url,
-            "time_offset_ms": self.status.time_offset_ms,
-            "prewarm_ok": self.status.prewarm_ok,
-            "transport": self.status.transport,
-            "target_sku_id": self.status.target_sku_id,
-            "target_sku_desc": self.status.target_sku_desc,
-            "monitor_target_count": self.status.monitor_target_count,
-            "last_monitor_candidates": self.status.last_monitor_candidates,
-            "elapsed_ms": elapsed_ms,
-        }
+        return self._recorder.report(self.status)
+
+    @property
+    def _client(self) -> BiliClient | None:
+        """HTTP 客户端由上下文持有，监控与下单共用同一个实例。"""
+
+        return self._ctx.client
+
+    @_client.setter
+    def _client(self, value: BiliClient | None) -> None:
+        self._ctx.client = value
 
     # ---- 人工验证码交互（供 server 调用） ----
     def captcha_pending(self) -> dict[str, str] | None:
@@ -396,58 +116,6 @@ class Grabber:
         self._emit_status()
 
     # ---- 主流程 ----
-    async def _wait_until_prewarm(self, target: datetime | None) -> None:
-        if target is None:
-            return
-        self._set_phase(GrabPhase.PREWARM)
-        prewarm_at = target - timedelta(seconds=self.config.prewarm_seconds)
-        while True:
-            now = self._now_for(target)
-            remaining_to_prewarm = (prewarm_at - now).total_seconds()
-            if remaining_to_prewarm <= 0:
-                return
-            remaining_to_start = (target - now).total_seconds()
-            self._emit(f"距开抢还有 {remaining_to_start:.1f}s，等待预热", "info")
-            await asyncio.sleep(min(remaining_to_prewarm, self._coarse_wait_step(remaining_to_start)))
-
-    async def _wait_until_start(self, target: datetime | None = None) -> None:
-        if target is None:
-            target = self._parse_local_time(self.config.start_time, "开抢时间")
-        if target is None:
-            return
-        self._set_phase(GrabPhase.START_WAIT)
-        initial_remaining = (target - self._now_for(target)).total_seconds()
-        if initial_remaining <= 0:
-            return
-        end_at = time.perf_counter() + initial_remaining
-        last_logged_second: int | None = None
-        while True:
-            remaining = end_at - time.perf_counter()
-            if remaining <= 0:
-                break
-            current_second = int(remaining)
-            if remaining <= 3.0:
-                if last_logged_second != 0:
-                    self._emit("进入毫秒级倒计时，等待开抢点", "info")
-                    last_logged_second = 0
-                step = 0.05
-            elif current_second != last_logged_second:
-                self._emit(f"距开抢还有 {remaining:.1f}s", "info")
-                last_logged_second = current_second
-                step = 0.5 if remaining <= 10.0 else 1.0
-            else:
-                step = 0.5 if remaining <= 10.0 else 1.0
-            await asyncio.sleep(min(remaining, step))
-
-    def _coarse_wait_step(self, remaining_to_start: float) -> float:
-        if remaining_to_start > 300:
-            return 60.0
-        if remaining_to_start > 60:
-            return 10.0
-        if remaining_to_start > 10:
-            return 2.0
-        return 1.0
-
     async def _resolve_buyers(self) -> list[ticket.Buyer]:
         assert self._client is not None
         wanted_ids = list(dict.fromkeys(self.config.buyer_ids))
@@ -470,8 +138,8 @@ class Grabber:
             project = await ticket.get_project(self._client, self.config.project_id)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"获取演出信息失败: {exc}") from exc
-        self._last_project = project
-        target = self._find_target(project, self.config.sku_id, 0)
+        self._ctx.last_project = project
+        target = grab_targets.find_target(self.config, project, self.config.sku_id, 0)
         self._primary_target = target
         return target.price
 
@@ -498,232 +166,40 @@ class Grabber:
                 await asyncio.sleep(min(1.0 * attempt, 3.0))
         raise RuntimeError("预热数据获取失败")  # 理论不可达，满足类型检查
 
-    def _clear_cached_token(self) -> None:
-        self._cached_token = ""
-        self._cached_ptoken = ""
-        self._cached_token_at = 0.0
-        self._cached_token_sku_id = 0
-
-    def _set_active_target(self, target: TicketTarget) -> None:
-        if self.status.target_sku_id and self.status.target_sku_id != target.sku_id:
-            self._clear_cached_token()
-        self.status.target_sku_id = target.sku_id
-        self.status.target_sku_desc = target.desc or str(target.sku_id)
-
-    def _target_from_sku(self, sku: ticket.TicketSku, order: int) -> TicketTarget:
-        return TicketTarget(
-            screen_id=self.config.screen_id,
-            sku_id=sku.sku_id,
-            desc=sku.desc,
-            price=sku.price,
-            sale_flag=sku.sale_flag,
-            num=sku.num,
-            order=order,
-        )
-
-    def _monitor_sku_ids(self) -> list[int]:
-        ids = list(dict.fromkeys(self.config.return_monitor_sku_ids or []))
-        if self.config.sku_id > 0 and self.config.sku_id not in ids:
-            ids.append(self.config.sku_id)
-        return ids or [self.config.sku_id]
-
-    def _find_target(self, project: ticket.Project, sku_id: int, order: int = 0) -> TicketTarget:
-        for screen in project.screens:
-            if screen.screen_id != self.config.screen_id:
-                continue
-            for sku in screen.skus:
-                if sku.sku_id == sku_id:
-                    return self._target_from_sku(sku, order)
-        raise RuntimeError("未匹配到指定场次/票档，请重新加载演出并选择票档")
-
-    def _monitor_targets_from_project(self, project: ticket.Project) -> list[TicketTarget]:
-        wanted_ids = self._monitor_sku_ids()
-        found: dict[int, TicketTarget] = {}
-        for order, sku_id in enumerate(wanted_ids):
-            try:
-                found[sku_id] = self._find_target(project, sku_id, order)
-            except RuntimeError:
-                continue
-
-        missing = [str(sku_id) for sku_id in wanted_ids if sku_id not in found]
-        if missing:
-            raise RuntimeError(f"回流候选票档不在当前场次中: {', '.join(missing)}")
-        targets = [found[sku_id] for sku_id in wanted_ids]
-        self.status.monitor_target_count = len(targets)
-        return targets
-
-    def _available_monitor_targets(self, project: ticket.Project) -> list[TicketTarget]:
-        targets = self._monitor_targets_from_project(project)
-        self.status.last_monitor_candidates = self._format_monitor_candidates(targets)
-        available = [target for target in targets if self._target_looks_available(target)]
-        return sorted(available, key=lambda target: (-target.num, target.order))
-
-    def _parse_local_time(self, value: str, label: str) -> datetime | None:
-        if not value:
-            return None
-        try:
-            target = datetime.fromisoformat(value)
-        except ValueError as exc:
-            raise RuntimeError(f"{label}格式无效: {value}") from exc
-        if target.tzinfo is None:
-            target = target.replace(tzinfo=datetime.now().astimezone().tzinfo)
-        return target
-
-    def _now_for(self, target: datetime) -> datetime:
-        return datetime.now(tz=target.tzinfo) + timedelta(seconds=self._time_offset_seconds)
-
-    def _interval_seconds(self) -> float:
-        return self.config.interval_ms / 1000.0
-
-    def _network_retry_delay(self) -> float:
-        base = max(self._interval_seconds(), 0.2)
-        multiplier = min(2 ** max(self._consecutive_network_errors - 1, 0), 8)
-        return min(base * multiplier, self.config.network_backoff_max_ms / 1000.0)
-
-    # ---- AIMD 自适应限速 ----
-    def _aimd_floor(self) -> float:
-        return max(self._interval_seconds(), 0.05)
-
-    def _aimd_ceiling(self) -> float:
-        return max(self.config.max_interval_ms / 1000.0, self._aimd_floor())
-
-    def _on_rate_limit(self) -> None:
-        """收到限流信号（429/412）：乘性退避抬高动态间隔。"""
-
-        self.status.rate_limit_count += 1
-        self.status.consecutive_rate_limits += 1
-        self._rate_limit_recovery_remaining = _RATE_LIMIT_RECOVERY_RESPONSES
-        if self.config.adaptive_rate_enabled:
-            self._dynamic_interval = min(self._dynamic_interval * 2.0, self._aimd_ceiling())
-        self.status.dynamic_interval_ms = int(round(self._dynamic_interval * 1000))
-
-    def _on_retryable(self) -> None:
-        """收到可重试（拥堵）响应：限流恢复期先稳住，之后缓慢加速。"""
-
-        self.status.consecutive_rate_limits = 0
-        if self.config.adaptive_rate_enabled:
-            if self._rate_limit_recovery_remaining > 0:
-                self._rate_limit_recovery_remaining -= 1
-            else:
-                self._dynamic_interval = max(
-                    self._dynamic_interval - _CONGESTION_DECREASE_SECONDS,
-                    self._aimd_floor(),
-                )
-        self.status.dynamic_interval_ms = int(round(self._dynamic_interval * 1000))
-
-    def _retry_delay(self) -> float:
-        if not self.config.adaptive_rate_enabled:
-            return self._interval_seconds()
-        return self._dynamic_interval
-
-    def _reusable_token(self, target: TicketTarget) -> str:
-        """返回可复用的 prepare token（仅拥堵重试且未过期），否则空串。"""
-
-        if not self._cached_token or self._cached_token_sku_id != target.sku_id:
-            return ""
-        if time.perf_counter() - self._cached_token_at > _TOKEN_REUSE_SECONDS:
-            self._clear_cached_token()
-            return ""
-        return self._cached_token
-
-    def _rate_limit_retry_delay(self) -> float:
-        self._on_rate_limit()
-        base = self._dynamic_interval if self.config.adaptive_rate_enabled else self._interval_seconds()
-        delay = max(base, self.config.rate_limit_backoff_ms / 1000.0)
-        if self.status.consecutive_rate_limits >= _RATE_LIMIT_COOLDOWN_AFTER:
-            cooldown = self.config.rate_limit_cooldown_ms / 1000.0
-            cooldown_round = self.status.consecutive_rate_limits - _RATE_LIMIT_COOLDOWN_AFTER
-            delay = max(delay, min(cooldown * (2**cooldown_round), _RATE_LIMIT_COOLDOWN_MAX_SECONDS))
-        return delay
-
-    def _retry_result(
-        self,
-        reason: str,
-        delay: float,
-        *,
-        code: int | None = None,
-        kind: ResultKind | None = None,
-        endpoint: str = "",
-    ) -> AttemptResult:
-        self.status.retry_reason = reason
-        self.status.retry_delay_ms = int(round(delay * 1000))
-        return AttemptResult(
-            AttemptOutcome.RETRY,
-            retry_delay=delay,
-            retry_reason=reason,
-            code=code,
-            kind=kind,
-            endpoint=endpoint,
-        )
-
     def _clear_retry_status(self) -> None:
-        self.status.retry_reason = ""
-        self.status.retry_delay_ms = 0
-
-    def _outcome_result(
-        self,
-        outcome: AttemptOutcome,
-        *,
-        code: int | None = None,
-        kind: ResultKind | None = None,
-        endpoint: str = "",
-    ) -> AttemptResult:
-        if outcome is not AttemptOutcome.RETRY:
-            self._clear_retry_status()
-        return AttemptResult(outcome, code=code, kind=kind, endpoint=endpoint)
-
-    def _elapsed_ms(self, started_at: float) -> int:
-        return max(0, int(round((time.perf_counter() - started_at) * 1000)))
-
-    def _record_attempt_timing(self, started_at: float) -> None:
-        elapsed = self._elapsed_ms(started_at)
-        self.status.last_attempt_ms = elapsed
-        self._attempt_ms_total += elapsed
-        if self.status.attempts > 0:
-            self.status.avg_attempt_ms = int(round(self._attempt_ms_total / self.status.attempts))
+        self._ctx.clear_retry_status()
 
     async def _sleep_before_retry(self, result: AttemptResult) -> None:
         if result.retry_delay <= 0:
             return
-        self.status.effective_delay_ms = self.status.retry_delay_ms
-        self._record_telemetry(
-            "retry_sleep",
-            endpoint=self.status.last_endpoint,
-            attempt=self.status.attempts,
-            code=self.status.last_code,
-            delay_ms=self.status.retry_delay_ms,
-            outcome=result.retry_reason,
-        )
-        self._emit(
-            f"等待 {self.status.retry_delay_ms}ms 后重试（{result.retry_reason}）",
-            "info",
-            retry_delay_ms=self.status.retry_delay_ms,
+        delay_ms = self.status.retry_delay_ms
+        await self._ctx.sleep_with_telemetry(
+            result.retry_delay,
+            delay_ms,
+            result.retry_reason,
+            f"等待 {delay_ms}ms 后重试（{result.retry_reason}）",
+            retry_delay_ms=delay_ms,
             retry_reason=result.retry_reason,
         )
-        self._emit_status()
-        await asyncio.sleep(result.retry_delay)
 
     async def _sleep_continue_burst(self) -> None:
         """库存不足但尚未达到回监控的冲刺轮数时，给一个自适应间隔再继续冲刺。"""
 
-        delay = self._retry_delay()
+        delay = self._pacing.retry_delay()
         if delay <= 0:
             return
         delay_ms = int(round(delay * 1000))
-        self.status.effective_delay_ms = delay_ms
-        self._record_telemetry(
-            "retry_sleep",
-            endpoint=self.status.last_endpoint,
-            attempt=self.status.attempts,
-            code=self.status.last_code,
-            delay_ms=delay_ms,
-            outcome="库存不足继续冲刺",
+        await self._ctx.sleep_with_telemetry(
+            delay,
+            delay_ms,
+            "库存不足继续冲刺",
+            f"库存不足，继续冲刺（{delay_ms}ms 后重试）",
+            emit_status=False,
         )
-        self._emit(f"库存不足，继续冲刺（{delay_ms}ms 后重试）", "info")
-        await asyncio.sleep(delay)
 
     def _record_burst_finish(self, decision: BurstDecision) -> None:
-        self._record_telemetry(
+        self._recorder.record(
+            self.status,
             "burst_finish",
             endpoint=self.status.last_endpoint,
             attempt=self.status.attempts,
@@ -752,339 +228,237 @@ class Grabber:
         if delay <= 0:
             return
         if deadline is not None:
-            remaining = (deadline - self._now_for(deadline)).total_seconds()
+            remaining = self._clock.remaining_seconds(deadline)
             if remaining <= 0:
                 return
             delay = min(delay, remaining)
 
         delay_ms = int(round(delay * 1000))
-        self.status.effective_delay_ms = delay_ms
-        self._record_telemetry(
-            "retry_sleep",
-            endpoint=self.status.last_endpoint,
-            attempt=self.status.attempts,
-            code=self.status.last_code,
-            delay_ms=delay_ms,
-            outcome="burst 间隔等待",
+        await self._ctx.sleep_with_telemetry(
+            delay,
+            delay_ms,
+            "burst 间隔等待",
+            f"等待 {delay_ms}ms 后进入下一轮监控/冲刺",
         )
-        self._emit(f"等待 {delay_ms}ms 后进入下一轮监控/冲刺", "info")
-        self._emit_status()
-        await asyncio.sleep(delay)
 
-    async def _wait_for_return_ticket(self, deadline: datetime) -> list[TicketTarget]:
+    def _reset_run_state(self, *, running: bool = False) -> None:
+        """初始化每次运行拥有的状态，避免上一次运行的数据残留。"""
+
+        self.status = GrabberStatus(running=running)
+        self.strategy = BalancedStrategyController()
+        self._attempt_ms_total = 0
+        self._pacing = PacingController(self.config, self.status)
+        if running:
+            self.status.dynamic_interval_ms = int(round(self._pacing.dynamic_interval * 1000))
+        self._tokens = PrepareTokenCache()
+        self._clock = GrabClock(self.config, self._emit, self._set_phase)
+        self._recorder = RunRecorder()
+        self._ctx = GrabContext(
+            config=self.config,
+            status=self.status,
+            recorder=self._recorder,
+            pacing=self._pacing,
+            tokens=self._tokens,
+            clock=self._clock,
+            emit=self._emit,
+            emit_status=self._emit_status,
+            set_phase=self._set_phase,
+        )
+        self._monitor = ReturnTicketMonitor(self._ctx)
+        self._executor = OrderExecutor(self._ctx, self._invoke_risk_handler)
+        self._primary_target: TicketTarget | None = None
+
+    async def _prepare_run(self) -> tuple[list[ticket.Buyer], TicketTarget, datetime | None]:
+        """预热连接、解析购票信息，然后等待开抢。"""
+
         assert self._client is not None
-        self._set_phase(GrabPhase.SOLD_OUT_MONITOR)
-        interval = self.config.monitor_interval_ms / 1000.0
-        while True:
-            remaining = (deadline - self._now_for(deadline)).total_seconds()
-            if remaining <= 0:
-                self.status.finished_reason = "达到监控截止时间"
-                self._emit("已达到监控截止时间，停止", "warn")
-                return []
-
-            self.status.monitor_checks += 1
-            self.status.last_endpoint = "project"
+        start_target = self._clock.parse(self.config.start_time, "开抢时间")
+        if self.config.time_sync_enabled and hasattr(self._client, "sync_server_time"):
             try:
-                project = await ticket.get_project(self._client, self.config.project_id)
-                self._last_project = project
-                available_targets = self._available_monitor_targets(project)
+                offset_ms = await self._client.sync_server_time()
             except Exception as exc:  # noqa: BLE001
-                rate_limit_code = _rate_limit_code_from_exception(exc)
-                delay = min(interval, remaining)
-                if rate_limit_code is not None:
-                    self._set_phase(GrabPhase.RATE_LIMIT_COOLDOWN)
-                    self.status.last_code = rate_limit_code
-                    self.status.last_message = f"HTTP {rate_limit_code}"
-                    delay = min(max(interval, self._rate_limit_retry_delay()), remaining)
-                    self.status.retry_reason = "监控请求过频/风控拦截"
-                    self.status.retry_delay_ms = int(round(delay * 1000))
-                self.status.effective_delay_ms = int(round(delay * 1000))
-                self.status.last_stock_status = f"监控异常: {exc}"
-                self._record_telemetry(
-                    "monitor_check",
-                    endpoint="project",
-                    code=rate_limit_code,
-                    delay_ms=self.status.effective_delay_ms,
-                    stock_status=self.status.last_stock_status,
-                    outcome="error",
-                )
-                self._emit(f"[监控 {self.status.monitor_checks}] 获取票档失败: {exc}", "warn")
-                self._emit_status()
-                await asyncio.sleep(delay)
-                self._set_phase(GrabPhase.SOLD_OUT_MONITOR)
-                continue
+                offset_ms = 0
+                self._emit(f"服务端时间同步失败，将使用本机时间: {exc}", "warn")
+            else:
+                self._emit(f"服务端时间偏移估算 {offset_ms}ms", "info")
+            self.status.time_offset_ms = offset_ms
+            self._clock.set_offset_ms(offset_ms)
+            self._emit_status()
 
-            if self.status.retry_reason == "监控请求过频/风控拦截":
-                self._clear_retry_status()
-            self.status.last_stock_status = self.status.last_monitor_candidates
-            self._record_telemetry(
-                "monitor_check",
-                endpoint="project",
-                code=0,
-                stock_status=self.status.last_stock_status,
-                outcome="available" if available_targets else "unavailable",
-            )
+        self._set_phase(GrabPhase.PREWARM)
+        await self._clock.wait_until_prewarm(start_target)
+        self._emit("开始抢票预热", "info")
+        if self.config.connection_prewarm_enabled and hasattr(self._client, "prewarm_connection"):
+            try:
+                self.status.prewarm_ok = await self._client.prewarm_connection()
+            except Exception as exc:  # noqa: BLE001
+                self.status.prewarm_ok = False
+                self._emit(f"会员购连接预热异常，将继续抢票: {exc}", "warn")
+                self._emit_status()
+            else:
+                if self.status.prewarm_ok:
+                    self._emit(f"会员购连接已预热（{self.status.transport or 'http'}）", "info")
+                else:
+                    self._emit("会员购连接预热失败，将继续抢票", "warn")
+                self._emit_status()
+
+        if await self._client.gen_bili_ticket():
+            self._emit("bili_ticket 已刷新", "info")
+        else:
+            self._emit("bili_ticket 生成失败，将继续抢票", "warn")
+
+        deadline: datetime | None = None
+        if self.config.return_monitor_enabled:
+            deadline = self._clock.parse(self.config.monitor_end_time, "监控截止时间")
+            if deadline is None:
+                raise RuntimeError("启用回流票监控时必须设置监控截止时间")
+            if self._clock.now(deadline) >= deadline:
+                raise RuntimeError("监控截止时间已过期")
+
+        buyers, pay_money = await self._resolve_prewarm_data()
+        self._ctx.current_pay_money = pay_money
+        primary_target = self._primary_target or TicketTarget(
+            screen_id=self.config.screen_id,
+            sku_id=self.config.sku_id,
+            desc=f"sku_id={self.config.sku_id}",
+            price=pay_money,
+        )
+        self._ctx.set_active_target(primary_target)
+        if self.config.return_monitor_enabled:
+            project = self._ctx.last_project
+            if project is None:
+                assert self._client is not None
+                project = await ticket.get_project(self._client, self.config.project_id)
+                self._ctx.last_project = project
+            monitor_targets = self._ctx.monitor_targets(project)
+            self.status.last_monitor_candidates = grab_targets.format_monitor_candidates(monitor_targets)
             self._emit(
-                f"[监控 {self.status.monitor_checks}] {self.status.last_stock_status}",
+                f"回流监控候选票档 {len(monitor_targets)} 个：{self.status.last_monitor_candidates}",
                 "info",
             )
             self._emit_status()
-            if available_targets:
-                chosen = available_targets[0]
-                self._emit(
-                    (
-                        "发现回流候选票档疑似可售："
-                        f"{chosen.desc}（sku_id={chosen.sku_id}，库存提示 {chosen.num}），"
-                        f"本轮监控候选 {len(available_targets)} 个"
-                    ),
-                    "success",
-                )
-                return available_targets
-
-            await asyncio.sleep(min(interval, remaining))
-
-    def _format_stock_status(self, target: TicketTarget) -> str:
-        sale_flag = target.sale_flag or "状态未知"
-        return f"{target.desc} {sale_flag} 库存提示 {target.num}"
-
-    def _format_monitor_candidates(self, targets: list[TicketTarget]) -> str:
-        if not targets:
-            return "未找到回流候选票档"
-        return "；".join(self._format_stock_status(target) for target in targets)
-
-    def _target_looks_available(self, target: TicketTarget) -> bool:
-        text = target.sale_flag.strip()
-        unavailable_words = ("售罄", "缺货", "不可售", "未开售", "暂停售票", "停售", "无票")
-        if any(word in text for word in unavailable_words):
-            return False
-        if target.num >= self.config.count:
-            return True
-        if not text:
-            return False
-        available_words = ("购买", "选座", "预订", "可售", "销售中", "立即")
-        return any(word in text for word in available_words)
-
-    def _sku_looks_available(self, sku: ticket.TicketSku) -> bool:
-        return self._target_looks_available(self._target_from_sku(sku, 0))
-
-    async def _refresh_return_targets(self) -> list[TicketTarget]:
-        assert self._client is not None
-        try:
-            project = await ticket.get_project(self._client, self.config.project_id)
-        except Exception as exc:  # noqa: BLE001
-            self._emit(f"复检回流候选票档失败: {exc}", "warn")
-            return []
-        self._last_project = project
-        try:
-            targets = self._available_monitor_targets(project)
-        except Exception as exc:  # noqa: BLE001
-            self._emit(f"复检回流候选票档失败: {exc}", "warn")
-            return []
-        self._record_telemetry(
-            "monitor_refresh",
-            endpoint="project",
-            code=0,
-            stock_status=self.status.last_monitor_candidates,
-            outcome="available" if targets else "unavailable",
+        self._emit(
+            (
+                f"购票人 {len(buyers)} 人，首发票档 {primary_target.desc} "
+                f"票价 {primary_target.price / 100:.2f} 元"
+            ),
+            "info",
         )
-        self._emit_status()
-        return targets
+
+        await self._clock.wait_until_start(start_target)
+        self._set_phase(GrabPhase.START_BURST)
+        self._emit("开始抢票", "info")
+        if self.config.return_monitor_enabled:
+            self._emit("回流票监控已启用；先对首发票档短冲刺，之后低频监控候选票档", "info")
+
+        return buyers, primary_target, deadline
+
+    async def _run_order_loop(
+        self,
+        buyers: list[ticket.Buyer],
+        primary_target: TicketTarget,
+        deadline: datetime | None,
+    ) -> None:
+        """执行首发冲刺与回流监控，直到停止或达到尝试上限。"""
+
+        extra_params: dict[str, Any] = {}
+        initial_burst_pending = self.config.return_monitor_enabled
+        next_burst_pause = 0.0
+
+        while self.status.attempts < self.config.max_attempts:
+            burst_targets = [primary_target]
+            if self.config.return_monitor_enabled:
+                if initial_burst_pending:
+                    initial_burst_pending = False
+                    self._start_burst(GrabPhase.START_BURST)
+                else:
+                    assert deadline is not None
+                    if next_burst_pause > 0:
+                        await self._sleep_between_bursts(next_burst_pause, deadline)
+                        next_burst_pause = 0.0
+                    monitor_result = await self._monitor.wait_for_return_ticket(deadline)
+                    if not monitor_result:
+                        return
+                    burst_targets = list(monitor_result)
+                    self._start_burst(GrabPhase.RETURN_BURST)
+            else:
+                if next_burst_pause > 0:
+                    await self._sleep_between_bursts(next_burst_pause, None)
+                    next_burst_pause = 0.0
+                self._start_burst(GrabPhase.START_BURST)
+
+            target_index = 0
+            refreshed_return_targets = False
+            while self.status.attempts < self.config.max_attempts:
+                target = burst_targets[min(target_index, len(burst_targets) - 1)]
+                result = await self._executor.attempt(buyers, target, extra_params)
+                if result.outcome is AttemptOutcome.STOP:
+                    return
+                return_burst_active = (
+                    self.config.return_monitor_enabled and self.strategy.in_return_burst()
+                )
+                burst_decision = self.strategy.record_attempt(result)
+                sold_out_result = (
+                    result.outcome is AttemptOutcome.SOLD_OUT or result.kind is ResultKind.SOLD_OUT
+                )
+                if sold_out_result and return_burst_active:
+                    if target_index + 1 < len(burst_targets):
+                        previous = target
+                        target_index += 1
+                        next_target = burst_targets[target_index]
+                        self._emit(
+                            (
+                                f"{previous.desc} 库存不足，改试候选票档 "
+                                f"{next_target.desc}（sku_id={next_target.sku_id}）"
+                            ),
+                            "warn",
+                        )
+                        continue
+                    if not burst_decision.finished and self.status.attempts < self.config.max_attempts:
+                        await self._sleep_continue_burst()
+                        continue
+                if result.code == 100001 and return_burst_active and not refreshed_return_targets:
+                    refreshed_return_targets = True
+                    refreshed_targets = await self._monitor.refresh_return_targets()
+                    if refreshed_targets:
+                        burst_targets = refreshed_targets
+                        target_index = 0
+                        self._emit(
+                            (
+                                "接口提示暂无可售/状态波动，已复检项目详情并切到 "
+                                f"{burst_targets[0].desc}（sku_id={burst_targets[0].sku_id}）"
+                            ),
+                            "info",
+                        )
+                        continue
+                if burst_decision.finished:
+                    self._record_burst_finish(burst_decision)
+                    next_burst_pause = self._burst_pause_seconds(burst_decision, result)
+                    break
+                if sold_out_result and self.config.return_monitor_enabled:
+                    if self.status.attempts < self.config.max_attempts:
+                        await self._sleep_continue_burst()
+                    continue
+                if self.status.attempts < self.config.max_attempts:
+                    await self._sleep_before_retry(result)
+
+        self.status.finished_reason = "达到最大尝试次数"
+        self._clear_retry_status()
+        self._emit("已达到最大尝试次数，停止", "warn")
 
     async def _run(self) -> None:
-        self.status = GrabberStatus(running=True)
-        self.strategy = BalancedStrategyController()
-        self._attempt_ms_total = 0
-        self._consecutive_network_errors = 0
-        self._dynamic_interval = self._interval_seconds()
-        self.status.dynamic_interval_ms = int(round(self._dynamic_interval * 1000))
-        self._cached_token = ""
-        self._cached_ptoken = ""
-        self._cached_token_at = 0.0
-        self._cached_token_sku_id = 0
-        self._telemetry_path = None
-        self._time_offset_seconds = 0.0
-        self._current_pay_money = 0
-        self._rate_limit_recovery_remaining = 0
-        self._primary_target = None
-        self._last_project = None
-        self._start_telemetry()
+        self._reset_run_state(running=True)
+        self._recorder.start(self.status, TELEMETRY_DIR)
         self._emit_status()
-        self._client = BiliClient(self.config.cookie, http2_enabled=self.config.http2_enabled)
-        self.status.transport = getattr(self._client, "transport", "")
         try:
+            self._client = BiliClient(self.config.cookie, http2_enabled=self.config.http2_enabled)
+            self.status.transport = getattr(self._client, "transport", "")
             if not self._client.is_logged_in:
                 self._emit("Cookie 不完整或未登录，无法抢票", "error")
                 self.status.finished_reason = "未登录"
                 return
-
-            start_target = self._parse_local_time(self.config.start_time, "开抢时间")
-            if self.config.time_sync_enabled and hasattr(self._client, "sync_server_time"):
-                try:
-                    offset_ms = await self._client.sync_server_time()
-                except Exception as exc:  # noqa: BLE001
-                    offset_ms = 0
-                    self._emit(f"服务端时间同步失败，将使用本机时间: {exc}", "warn")
-                else:
-                    self._emit(f"服务端时间偏移估算 {offset_ms}ms", "info")
-                self.status.time_offset_ms = offset_ms
-                self._time_offset_seconds = offset_ms / 1000.0
-                self._emit_status()
-
-            self._set_phase(GrabPhase.PREWARM)
-            await self._wait_until_prewarm(start_target)
-            self._emit("开始抢票预热", "info")
-            if self.config.connection_prewarm_enabled and hasattr(self._client, "prewarm_connection"):
-                try:
-                    self.status.prewarm_ok = await self._client.prewarm_connection()
-                except Exception as exc:  # noqa: BLE001
-                    self.status.prewarm_ok = False
-                    self._emit(f"会员购连接预热异常，将继续抢票: {exc}", "warn")
-                    self._emit_status()
-                else:
-                    if self.status.prewarm_ok:
-                        self._emit(f"会员购连接已预热（{self.status.transport or 'http'}）", "info")
-                    else:
-                        self._emit("会员购连接预热失败，将继续抢票", "warn")
-                    self._emit_status()
-
-            if await self._client.gen_bili_ticket():
-                self._emit("bili_ticket 已刷新", "info")
-            else:
-                self._emit("bili_ticket 生成失败，将继续抢票", "warn")
-
-            deadline: datetime | None = None
-            if self.config.return_monitor_enabled:
-                deadline = self._parse_local_time(self.config.monitor_end_time, "监控截止时间")
-                if deadline is None:
-                    raise RuntimeError("启用回流票监控时必须设置监控截止时间")
-                if self._now_for(deadline) >= deadline:
-                    raise RuntimeError("监控截止时间已过期")
-
-            buyers, pay_money = await self._resolve_prewarm_data()
-            self._current_pay_money = pay_money
-            primary_target = self._primary_target or TicketTarget(
-                screen_id=self.config.screen_id,
-                sku_id=self.config.sku_id,
-                desc=f"sku_id={self.config.sku_id}",
-                price=pay_money,
-            )
-            self._set_active_target(primary_target)
-            if self.config.return_monitor_enabled:
-                project = self._last_project
-                if project is None:
-                    assert self._client is not None
-                    project = await ticket.get_project(self._client, self.config.project_id)
-                    self._last_project = project
-                monitor_targets = self._monitor_targets_from_project(project)
-                self.status.last_monitor_candidates = self._format_monitor_candidates(monitor_targets)
-                self._emit(
-                    f"回流监控候选票档 {len(monitor_targets)} 个：{self.status.last_monitor_candidates}",
-                    "info",
-                )
-                self._emit_status()
-            self._emit(
-                (
-                    f"购票人 {len(buyers)} 人，首发票档 {primary_target.desc} "
-                    f"票价 {primary_target.price / 100:.2f} 元"
-                ),
-                "info",
-            )
-
-            await self._wait_until_start(start_target)
-            self._set_phase(GrabPhase.START_BURST)
-            self._emit("开始抢票", "info")
-            if self.config.return_monitor_enabled:
-                self._emit("回流票监控已启用；先对首发票档短冲刺，之后低频监控候选票档", "info")
-
-            extra_params: dict[str, Any] = {}
-            initial_burst_pending = self.config.return_monitor_enabled
-            next_burst_pause = 0.0
-
-            while self.status.attempts < self.config.max_attempts:
-                burst_targets = [primary_target]
-                if self.config.return_monitor_enabled:
-                    if initial_burst_pending:
-                        initial_burst_pending = False
-                        self._start_burst(GrabPhase.START_BURST)
-                    else:
-                        assert deadline is not None
-                        if next_burst_pause > 0:
-                            await self._sleep_between_bursts(next_burst_pause, deadline)
-                            next_burst_pause = 0.0
-                        monitor_result = await self._wait_for_return_ticket(deadline)
-                        if not monitor_result:
-                            return
-                        if monitor_result is True:  # 兼容测试中旧的 bool mock
-                            burst_targets = [primary_target]
-                        else:
-                            burst_targets = list(monitor_result)
-                        self._start_burst(GrabPhase.RETURN_BURST)
-                else:
-                    if next_burst_pause > 0:
-                        await self._sleep_between_bursts(next_burst_pause, None)
-                        next_burst_pause = 0.0
-                    self._start_burst(GrabPhase.START_BURST)
-
-                target_index = 0
-                refreshed_return_targets = False
-                while self.status.attempts < self.config.max_attempts:
-                    target = burst_targets[min(target_index, len(burst_targets) - 1)]
-                    result = await self._attempt_order(buyers, target, extra_params)
-                    if result.outcome is AttemptOutcome.STOP:
-                        return
-                    return_burst_active = (
-                        self.config.return_monitor_enabled
-                        and self.strategy.burst is not None
-                        and self.strategy.burst.phase is GrabPhase.RETURN_BURST
-                    )
-                    burst_decision = self.strategy.record_attempt(result)
-                    sold_out_result = (
-                        result.outcome is AttemptOutcome.SOLD_OUT or result.kind is ResultKind.SOLD_OUT
-                    )
-                    if sold_out_result and return_burst_active:
-                        if target_index + 1 < len(burst_targets):
-                            previous = target
-                            target_index += 1
-                            next_target = burst_targets[target_index]
-                            self._emit(
-                                (
-                                    f"{previous.desc} 库存不足，改试候选票档 "
-                                    f"{next_target.desc}（sku_id={next_target.sku_id}）"
-                                ),
-                                "warn",
-                            )
-                            continue
-                        if not burst_decision.finished and self.status.attempts < self.config.max_attempts:
-                            await self._sleep_continue_burst()
-                            continue
-                    if result.code == 100001 and return_burst_active and not refreshed_return_targets:
-                        refreshed_return_targets = True
-                        refreshed_targets = await self._refresh_return_targets()
-                        if refreshed_targets:
-                            burst_targets = refreshed_targets
-                            target_index = 0
-                            self._emit(
-                                (
-                                    "接口提示暂无可售/状态波动，已复检项目详情并切到 "
-                                    f"{burst_targets[0].desc}（sku_id={burst_targets[0].sku_id}）"
-                                ),
-                                "info",
-                            )
-                            continue
-                    if burst_decision.finished:
-                        self._record_burst_finish(burst_decision)
-                        next_burst_pause = self._burst_pause_seconds(burst_decision, result)
-                        break
-                    if sold_out_result and self.config.return_monitor_enabled:
-                        if self.status.attempts < self.config.max_attempts:
-                            await self._sleep_continue_burst()
-                        continue
-                    if self.status.attempts < self.config.max_attempts:
-                        await self._sleep_before_retry(result)
-
-            self.status.finished_reason = "达到最大尝试次数"
-            self._clear_retry_status()
-            self._emit("已达到最大尝试次数，停止", "warn")
+            buyers, primary_target, deadline = await self._prepare_run()
+            await self._run_order_loop(buyers, primary_target, deadline)
         except asyncio.CancelledError:
             self._emit("已手动停止", "warn")
             raise
@@ -1094,368 +468,11 @@ class Grabber:
         finally:
             self.status.running = False
             self._set_phase(GrabPhase.FINISHED)
-            self._record_telemetry("run_finish", outcome=self.status.finished_reason or "finished")
+            self._recorder.record(self.status, "run_finish", outcome=self.status.finished_reason or "finished")
             self._emit_status()
             if self._client:
                 await self._client.aclose()
                 self._client = None
-
-    async def _attempt_order(
-        self,
-        buyers: list[ticket.Buyer],
-        target: TicketTarget,
-        extra_params: dict[str, Any],
-    ) -> AttemptResult:
-        assert self._client is not None
-        self._set_active_target(target)
-        self.status.attempts += 1
-        attempt = self.status.attempts
-        attempt_started_at = time.perf_counter()
-        self.status.last_prepare_ms = 0
-        self.status.last_create_ms = 0
-        self.status.retry_reason = ""
-        self.status.retry_delay_ms = 0
-        self.status.effective_delay_ms = 0
-
-        token = self._reusable_token(target)
-        ptoken = ""
-        if token:
-            ptoken = self._cached_ptoken
-            self._emit(f"[{attempt}] 复用 {target.desc} prepare token，跳过预下单", "info")
-        else:
-            try:
-                self.status.last_endpoint = "prepare"
-                prepare_started_at = time.perf_counter()
-                prep = await ticket.prepare_order(
-                    self._client,
-                    self.config.project_id,
-                    target.screen_id,
-                    target.sku_id,
-                    self.config.count,
-                    buyers,
-                )
-                self.status.last_prepare_ms = self._elapsed_ms(prepare_started_at)
-                self._record_telemetry(
-                    "prepare_result",
-                    endpoint="prepare",
-                    attempt=attempt,
-                    code=prep.code,
-                    kind=classify(prep.code).value,
-                    elapsed_ms=self.status.last_prepare_ms,
-                    outcome="token" if prep.token else "no_token",
-                )
-            except Exception as exc:  # noqa: BLE001 网络抖动等
-                self.status.last_prepare_ms = self._elapsed_ms(prepare_started_at)
-                self._clear_cached_token()
-                self.status.network_errors += 1
-                self._consecutive_network_errors += 1
-                self._record_attempt_timing(attempt_started_at)
-                self.status.last_endpoint = "prepare"
-                self._record_telemetry(
-                    "attempt_result",
-                    endpoint="prepare",
-                    attempt=attempt,
-                    elapsed_ms=self.status.last_prepare_ms,
-                    outcome="network_error",
-                )
-                self._emit(f"[{attempt}] prepare 异常: {exc}", "warn")
-                self._emit_status()
-                return self._retry_result(
-                    "prepare 网络异常",
-                    self._network_retry_delay(),
-                    endpoint="prepare",
-                )
-
-            if not prep.token:
-                self._clear_cached_token()
-                self._consecutive_network_errors = 0
-                self._record_attempt_timing(attempt_started_at)
-                return await self._handle_prepare_failure(prep, attempt, extra_params)
-
-            token = prep.token
-            ptoken = prep.ptoken
-            self._cached_token = token
-            self._cached_ptoken = ptoken
-            self._cached_token_sku_id = target.sku_id
-            self._cached_token_at = time.perf_counter()
-
-        try:
-            self.status.last_endpoint = "create"
-            self.status.effective_order_attempts += 1
-            create_started_at = time.perf_counter()
-            result = await ticket.create_order(
-                self._client,
-                self.config.project_id,
-                target.screen_id,
-                target.sku_id,
-                self.config.count,
-                token,
-                buyers,
-                target.price,
-                extra_params=extra_params or None,
-                ptoken=ptoken,
-                contact_name=self.config.contact_name,
-                contact_tel=self.config.contact_tel,
-            )
-            self.status.last_create_ms = self._elapsed_ms(create_started_at)
-            self._consecutive_network_errors = 0
-        except Exception as exc:  # noqa: BLE001 网络抖动等
-            self.status.last_create_ms = self._elapsed_ms(create_started_at)
-            self._clear_cached_token()
-            self.status.network_errors += 1
-            self._consecutive_network_errors += 1
-            self._record_attempt_timing(attempt_started_at)
-            self.status.last_endpoint = "create"
-            self._record_telemetry(
-                "attempt_result",
-                endpoint="create",
-                attempt=attempt,
-                elapsed_ms=self.status.last_create_ms,
-                outcome="network_error",
-            )
-            self._emit(f"[{attempt}] create 异常: {exc}", "warn")
-            self._emit_status()
-            return self._retry_result(
-                "create 网络异常",
-                self._network_retry_delay(),
-                endpoint="create",
-            )
-
-        self._record_attempt_timing(attempt_started_at)
-
-        # 默认让 token 失效；仅在拥堵可重试时短时复用（见末尾分支）
-        self._clear_cached_token()
-
-        self.status.last_code = result.code
-        self.status.last_message = result.message or describe(result.code)
-        kind = classify(result.code)
-        self._record_telemetry(
-            "attempt_result",
-            endpoint="create",
-            attempt=attempt,
-            code=result.code,
-            kind=kind.value,
-            elapsed_ms=self.status.last_attempt_ms,
-            outcome=result.message or describe(result.code),
-        )
-        self._emit(
-            f"[{attempt}] code={result.code} {self.status.last_message}",
-            "info",
-            code=result.code,
-        )
-        self._emit_status()
-
-        if kind is ResultKind.SUCCESS or _has_pending_order(result.message, result.code):
-            self.status.success = True
-            self.status.order_id = result.order_id
-            self.status.finished_reason = "订单已生成"
-            success_message = result.message or "订单已生成，请在 10 分钟内完成支付"
-            self._emit(
-                f"{success_message} 请尽快前往 B 站完成支付",
-                "success",
-                order_id=result.order_id,
-            )
-            await self._prepare_payment_info(result.order_id)
-            await self._notify_payment_required(
-                result.order_id,
-                success_message,
-                payment_url=self.status.payment_url,
-            )
-            return self._outcome_result(
-                AttemptOutcome.STOP,
-                code=result.code,
-                kind=kind,
-                endpoint="create",
-            )
-
-        if kind is ResultKind.FATAL:
-            self.status.finished_reason = self.status.last_message
-            self._emit(f"致命错误，停止抢票: {self.status.last_message}", "error")
-            return self._outcome_result(
-                AttemptOutcome.STOP,
-                code=result.code,
-                kind=kind,
-                endpoint="create",
-            )
-
-        if kind is ResultKind.RISK:
-            ok = await self._handle_risk(result.v_voucher, extra_params)
-            if ok:
-                return self._retry_result(
-                    "风控验证通过",
-                    self._interval_seconds(),
-                    code=result.code,
-                    kind=kind,
-                    endpoint="create",
-                )
-            return self._retry_result(
-                "风控处理失败",
-                self._rate_limit_retry_delay(),
-                code=result.code,
-                kind=kind,
-                endpoint="create",
-            )
-
-        if result.code == 100051:
-            return self._retry_result(
-                "prepare token 过期，重新预下单",
-                self._interval_seconds(),
-                code=result.code,
-                kind=kind,
-                endpoint="create",
-            )
-
-        if result.code == 100034 and self._apply_corrected_pay_money(result.pay_money, target):
-            return self._retry_result(
-                "票价已刷新，重新预下单",
-                self._interval_seconds(),
-                code=result.code,
-                kind=kind,
-                endpoint="create",
-            )
-
-        if self.config.return_monitor_enabled and kind is ResultKind.SOLD_OUT:
-            self.status.sold_out_count += 1
-            self._emit("下单时库存不足", "warn")
-            return self._outcome_result(
-                AttemptOutcome.SOLD_OUT,
-                code=result.code,
-                kind=kind,
-                endpoint="create",
-            )
-
-        if kind is ResultKind.SOLD_OUT:
-            self.status.sold_out_count += 1
-            return self._retry_result(
-                "库存不足/已售罄",
-                self._retry_delay(),
-                code=result.code,
-                kind=kind,
-                endpoint="create",
-            )
-
-        if kind is ResultKind.RATE_LIMIT:
-            self._set_phase(GrabPhase.RATE_LIMIT_COOLDOWN)
-            return self._retry_result(
-                "请求过频/风控拦截",
-                self._rate_limit_retry_delay(),
-                code=result.code,
-                kind=kind,
-                endpoint="create",
-            )
-
-        self.status.congestion_count += 1
-        self._set_phase(GrabPhase.CONGESTION_RETRY)
-        self._on_retryable()
-        self._cached_token = token  # 拥堵可重试，短时复用该 token
-        self._cached_ptoken = ptoken
-        self._cached_token_sku_id = target.sku_id
-        self._cached_token_at = time.perf_counter()
-        return self._retry_result(
-            "接口返回可重试",
-            self._retry_delay(),
-            code=result.code,
-            kind=kind,
-            endpoint="create",
-        )
-
-    async def _handle_prepare_failure(
-        self,
-        prep: ticket.PrepareResult,
-        attempt: int,
-        extra_params: dict[str, Any],
-    ) -> AttemptResult:
-        """prepare 未拿到 token 时，按错误码决定停止/风控/回流监控/重试。"""
-
-        code = prep.code
-        message = prep.message or describe(code)
-        self.status.last_code = code
-        self.status.last_message = message
-        self._emit(f"[{attempt}] prepare 失败: {message}", "warn", code=code)
-        self._emit_status()
-
-        kind = classify(code)
-        if _has_pending_order(message, code):
-            self.status.success = True
-            self.status.finished_reason = "订单已生成"
-            self._emit(
-                f"{message} 请尽快前往 B 站完成支付",
-                "success",
-            )
-            await self._notify_payment_required("", message)
-            return self._outcome_result(
-                AttemptOutcome.STOP,
-                code=code,
-                kind=kind,
-                endpoint="prepare",
-            )
-
-        if kind is ResultKind.FATAL:
-            self.status.finished_reason = message
-            self._emit(f"致命错误，停止抢票: {message}", "error")
-            return self._outcome_result(
-                AttemptOutcome.STOP,
-                code=code,
-                kind=kind,
-                endpoint="prepare",
-            )
-
-        if kind is ResultKind.RISK:
-            ok = await self._handle_risk(prep.v_voucher, extra_params)
-            if ok:
-                return self._retry_result(
-                    "风控验证通过",
-                    self._interval_seconds(),
-                    code=code,
-                    kind=kind,
-                    endpoint="prepare",
-                )
-            return self._retry_result(
-                "风控处理失败",
-                self._rate_limit_retry_delay(),
-                code=code,
-                kind=kind,
-                endpoint="prepare",
-            )
-
-        if kind is ResultKind.SOLD_OUT:
-            self.status.sold_out_count += 1
-            if self.config.return_monitor_enabled:
-                self._emit("预下单时库存不足", "warn")
-                return self._outcome_result(
-                    AttemptOutcome.SOLD_OUT,
-                    code=code,
-                    kind=kind,
-                    endpoint="prepare",
-                )
-            return self._retry_result(
-                "库存不足/已售罄",
-                self._interval_seconds(),
-                code=code,
-                kind=kind,
-                endpoint="prepare",
-            )
-
-        if kind is ResultKind.RATE_LIMIT:
-            self._set_phase(GrabPhase.RATE_LIMIT_COOLDOWN)
-            return self._retry_result(
-                "请求过频/风控拦截",
-                self._rate_limit_retry_delay(),
-                code=code,
-                kind=kind,
-                endpoint="prepare",
-            )
-
-        self.status.congestion_count += 1
-        self._set_phase(GrabPhase.CONGESTION_RETRY)
-        self._on_retryable()
-        return self._retry_result(
-            "接口返回可重试",
-            self._retry_delay(),
-            code=code,
-            kind=kind,
-            endpoint="prepare",
-        )
 
     async def _handle_risk(self, v_voucher: str, extra_params: dict[str, Any]) -> bool:
         if not v_voucher:
@@ -1478,71 +495,16 @@ class Grabber:
             self.status.waiting_captcha = False
             self._emit_status()
 
-    def _apply_corrected_pay_money(self, pay_money: int, target: TicketTarget | None = None) -> bool:
-        if pay_money <= 0:
-            return False
-        if self.config.count > 1 and pay_money % self.config.count == 0:
-            pay_money = pay_money // self.config.count
-        current_price = target.price if target is not None else self._current_pay_money
-        if pay_money <= 0 or pay_money == current_price:
-            return False
-        if target is not None:
-            target.price = pay_money
-        self._current_pay_money = pay_money
-        target_label = f"{target.desc} " if target is not None else ""
-        self._emit(f"{target_label}票价已按接口提示刷新为 {pay_money / 100:.2f} 元", "warn")
-        return True
+    async def _invoke_risk_handler(self, v_voucher: str, extra_params: dict[str, Any]) -> bool:
+        """交给下单执行器的风控入口。
 
-    async def _prepare_payment_info(self, order_id: str) -> None:
-        if not self.config.payment_link_enabled or not order_id:
-            return
-        self.status.payment_url = ticket.get_order_detail_url(order_id)
-        try:
-            assert self._client is not None
-            self.status.pay_qrcode_url = await ticket.get_pay_qrcode_url(self._client, order_id)
-        except Exception as exc:  # noqa: BLE001
-            self._emit(f"支付二维码获取失败: {exc}", "warn")
-        self._record_telemetry(
-            "payment_info",
-            endpoint="payment",
-            attempt=self.status.attempts,
-            code=self.status.last_code,
-            outcome="ready" if self.status.payment_url else "unavailable",
-        )
-        self._emit_status()
+        每次调用时才解析 ``_handle_risk``，因此子类或测试替换该方法后立即生效；
+        若在装配执行器时就绑定，替换会被已捕获的旧方法挡住。
+        """
 
-    async def _notify_payment_required(
-        self,
-        order_id: str,
-        message: str = "订单已生成",
-        *,
-        payment_url: str = "",
-    ) -> None:
-        try:
-            title = "会员购订单待支付"
-            body = (
-                f"订单 {order_id} 已生成，请在 10 分钟内支付"
-                if order_id
-                else f"{message} 请尽快前往 B 站订单页支付"
-            )
-            if payment_url:
-                body = f"{body}\n付款页：{payment_url}"
-            await notify.send_all(
-                self.config.notify,
-                title=title,
-                body=body,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._emit(f"推送失败: {exc}", "warn")
+        return await self._handle_risk(v_voucher, extra_params)
 
 
-def _has_pending_order(message: str, code: int | None = None) -> bool:
-    """会员购在已锁单/待支付时可能只返回提示文案，而不是标准成功码。"""
-
-    return code in {100003, 100048, 100079} or "尚未完成订单" in message or "待支付" in message
-
-
-# 预热解析时这些错误属于配置/校验问题，重试也不会变好，应立即中止
 _PERMANENT_RESOLVE_KEYWORDS = (
     "未匹配",
     "不能重复",
@@ -1555,10 +517,3 @@ _PERMANENT_RESOLVE_KEYWORDS = (
 def _is_permanent_resolve_error(exc: Exception) -> bool:
     message = str(exc)
     return any(keyword in message for keyword in _PERMANENT_RESOLVE_KEYWORDS)
-
-
-def _rate_limit_code_from_exception(exc: Exception) -> int | None:
-    match = re.search(r"\b(412|429)\b", str(exc))
-    if not match:
-        return None
-    return int(match.group(1))
