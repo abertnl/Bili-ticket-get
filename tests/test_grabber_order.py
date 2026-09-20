@@ -3,17 +3,18 @@
 from unittest.mock import AsyncMock, patch
 
 from app.bili import ticket
-from app.grabber import AttemptOutcome, Grabber, _has_pending_order
-from tests.helpers import FakeBiliClient, GrabberTestCase, ok_prepare
+from app.grab_order import OrderExecutor, has_pending_order
+from app.grabber import AttemptOutcome, Grabber
+from tests.helpers import FakeBiliClient, GrabberTestCase, make_context, ok_prepare
 
 
 class GrabberOrderTests(GrabberTestCase):
     def test_has_pending_order_matches_known_payment_messages(self) -> None:
-        self.assertTrue(_has_pending_order("你有尚未完成订单，请先支付"))
-        self.assertTrue(_has_pending_order("存在待支付订单"))
-        self.assertTrue(_has_pending_order("重复购买", 100003))
-        self.assertTrue(_has_pending_order("重复订单", 100079))
-        self.assertFalse(_has_pending_order("库存不足"))
+        self.assertTrue(has_pending_order("你有尚未完成订单，请先支付"))
+        self.assertTrue(has_pending_order("存在待支付订单"))
+        self.assertTrue(has_pending_order("重复购买", 100003))
+        self.assertTrue(has_pending_order("重复订单", 100079))
+        self.assertFalse(has_pending_order("库存不足"))
 
     async def test_prepare_fatal_error_stops_before_create(self) -> None:
         events: list[dict] = []
@@ -96,9 +97,10 @@ class GrabberOrderTests(GrabberTestCase):
         self.assertEqual(grabber.status.attempts, 2)
 
     async def test_prepare_sold_out_without_monitor_uses_interval_retry(self) -> None:
-        grabber = Grabber(self.make_config())
+        ctx = make_context(self.make_config())
+        executor = OrderExecutor(ctx, AsyncMock(return_value=False))
 
-        result = await grabber._handle_prepare_failure(
+        result = await executor.handle_prepare_failure(
             ticket.PrepareResult(code=100009, message="库存不足"),
             attempt=1,
             extra_params={},
@@ -106,7 +108,7 @@ class GrabberOrderTests(GrabberTestCase):
 
         self.assertIs(result.outcome, AttemptOutcome.RETRY)
         self.assertEqual(result.retry_delay, 0.1)
-        self.assertEqual(grabber.status.retry_delay_ms, 100)
+        self.assertEqual(ctx.status.retry_delay_ms, 100)
 
     async def test_create_order_exception_retries_until_max_attempts(self) -> None:
         events: list[dict] = []

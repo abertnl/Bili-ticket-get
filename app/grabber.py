@@ -20,7 +20,7 @@ from .config import AppConfig
 from .grab_clock import GrabClock
 from .grab_context import GrabContext
 from .grab_monitor import ReturnTicketMonitor
-from .grab_order import OrderExecutor, has_pending_order
+from .grab_order import OrderExecutor
 from .grab_models import AttemptOutcome, AttemptResult, BurstDecision, BurstState, GrabPhase, GrabberStatus, TicketTarget
 from .grab_pacing import PacingController, PrepareTokenCache
 from .grab_strategy import BalancedStrategyController
@@ -286,7 +286,7 @@ class Grabber:
             self._emit_status()
 
         self._set_phase(GrabPhase.PREWARM)
-        await self._wait_until_prewarm(start_target)
+        await self._clock.wait_until_prewarm(start_target)
         self._emit("开始抢票预热", "info")
         if self.config.connection_prewarm_enabled and hasattr(self._client, "prewarm_connection"):
             try:
@@ -345,7 +345,7 @@ class Grabber:
             "info",
         )
 
-        await self._wait_until_start(start_target)
+        await self._clock.wait_until_start(start_target)
         self._set_phase(GrabPhase.START_BURST)
         self._emit("开始抢票", "info")
         if self.config.return_monitor_enabled:
@@ -376,7 +376,7 @@ class Grabber:
                     if next_burst_pause > 0:
                         await self._sleep_between_bursts(next_burst_pause, deadline)
                         next_burst_pause = 0.0
-                    monitor_result = await self._wait_for_return_ticket(deadline)
+                    monitor_result = await self._monitor.wait_for_return_ticket(deadline)
                     if not monitor_result:
                         return
                     burst_targets = list(monitor_result)
@@ -391,7 +391,7 @@ class Grabber:
             refreshed_return_targets = False
             while self.status.attempts < self.config.max_attempts:
                 target = burst_targets[min(target_index, len(burst_targets) - 1)]
-                result = await self._attempt_order(buyers, target, extra_params)
+                result = await self._executor.attempt(buyers, target, extra_params)
                 if result.outcome is AttemptOutcome.STOP:
                     return
                 return_burst_active = (
@@ -496,105 +496,13 @@ class Grabber:
             self._emit_status()
 
     async def _invoke_risk_handler(self, v_voucher: str, extra_params: dict[str, Any]) -> bool:
-        """晚绑定到 ``_handle_risk``，让测试对该方法的 patch 依然生效。"""
+        """交给下单执行器的风控入口。
+
+        每次调用时才解析 ``_handle_risk``，因此子类或测试替换该方法后立即生效；
+        若在装配执行器时就绑定，替换会被已捕获的旧方法挡住。
+        """
 
         return await self._handle_risk(v_voucher, extra_params)
-
-    # ---- 兼容转发 ----
-    # 现有回归测试直接访问这些成员。逻辑已搬到独立模块，这里只做转发，
-    # 待测试改到新单元后整块删除。
-    async def _attempt_order(
-        self,
-        buyers: list[ticket.Buyer],
-        target: TicketTarget,
-        extra_params: dict[str, Any],
-    ) -> AttemptResult:
-        return await self._executor.attempt(buyers, target, extra_params)
-
-    async def _handle_prepare_failure(
-        self,
-        prep: ticket.PrepareResult,
-        attempt: int,
-        extra_params: dict[str, Any],
-    ) -> AttemptResult:
-        return await self._executor.handle_prepare_failure(prep, attempt, extra_params)
-
-    def _apply_corrected_pay_money(self, pay_money: int, target: TicketTarget | None = None) -> bool:
-        return self._executor.apply_corrected_pay_money(pay_money, target)
-
-    def _sku_looks_available(self, sku: ticket.TicketSku) -> bool:
-        return grab_targets.sku_looks_available(self.config, sku)
-
-    def _parse_local_time(self, value: str, label: str) -> datetime | None:
-        return self._clock.parse(value, label)
-
-    async def _wait_until_prewarm(self, target: datetime | None) -> None:
-        await self._clock.wait_until_prewarm(target)
-
-    async def _wait_until_start(self, target: datetime | None = None) -> None:
-        await self._clock.wait_until_start(target)
-
-    async def _wait_for_return_ticket(self, deadline: datetime) -> list[TicketTarget]:
-        return await self._monitor.wait_for_return_ticket(deadline)
-
-    def _available_monitor_targets(self, project: ticket.Project) -> list[TicketTarget]:
-        return self._ctx.available_monitor_targets(project)
-
-    @property
-    def _dynamic_interval(self) -> float:
-        return self._pacing.dynamic_interval
-
-    @property
-    def _rate_limit_recovery_remaining(self) -> int:
-        return self._pacing.rate_limit_recovery_remaining
-
-    def _on_rate_limit(self) -> None:
-        self._pacing.on_rate_limit()
-
-    def _on_retryable(self) -> None:
-        self._pacing.on_retryable()
-
-    def _retry_delay(self) -> float:
-        return self._pacing.retry_delay()
-
-    def _reusable_token(self, target: TicketTarget) -> str:
-        return self._tokens.reusable(target)
-
-    @property
-    def _cached_token(self) -> str:
-        return self._tokens.token
-
-    @_cached_token.setter
-    def _cached_token(self, value: str) -> None:
-        self._tokens.token = value
-
-    @property
-    def _cached_ptoken(self) -> str:
-        return self._tokens.ptoken
-
-    @_cached_ptoken.setter
-    def _cached_ptoken(self, value: str) -> None:
-        self._tokens.ptoken = value
-
-    @property
-    def _cached_token_at(self) -> float:
-        return self._tokens.stored_at
-
-    @_cached_token_at.setter
-    def _cached_token_at(self, value: float) -> None:
-        self._tokens.stored_at = value
-
-    @property
-    def _cached_token_sku_id(self) -> int:
-        return self._tokens.sku_id
-
-    @_cached_token_sku_id.setter
-    def _cached_token_sku_id(self, value: int) -> None:
-        self._tokens.sku_id = value
-
-
-# 保持原有导入入口。
-_has_pending_order = has_pending_order
 
 
 _PERMANENT_RESOLVE_KEYWORDS = (

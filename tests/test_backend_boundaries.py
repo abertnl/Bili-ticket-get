@@ -187,11 +187,11 @@ class GrabberLifecycleTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value=value):
                 parsed = parse_local_datetime(value)
                 self.assertIsNotNone(parsed.tzinfo)
-                self.assertEqual(parsed, self.grabber._parse_local_time(value, "开抢时间"))
+                self.assertEqual(parsed, self.grabber._clock.parse(value, "开抢时间"))
                 self.assertEqual((parsed.hour, parsed.minute), (3, 4))
                 if value.endswith("+08:00"):
                     self.assertEqual(parsed.utcoffset().total_seconds(), 8 * 60 * 60)
         self.config.start_time = "invalid"
         self.assertEqual(validate_grab_config(self.config), "开抢时间格式无效")
         with self.assertRaisesRegex(RuntimeError, "^开抢时间格式无效: invalid$"):
-            self.grabber._parse_local_time("invalid", "开抢时间")
+            self.grabber._clock.parse("invalid", "开抢时间")

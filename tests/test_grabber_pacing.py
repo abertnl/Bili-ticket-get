@@ -1,11 +1,13 @@
 """限速退避与 prepare token 复用回归测试。"""
 
-import time
 from unittest.mock import AsyncMock, patch
 
 from app.bili import ticket
-from app.grabber import AttemptOutcome, Grabber, TicketTarget
-from tests.helpers import FakeBiliClient, GrabberTestCase, ok_prepare
+from app.grab_models import AttemptOutcome, GrabberStatus, TicketTarget
+from app.grab_order import OrderExecutor
+from app.grab_pacing import PacingController, PrepareTokenCache
+from app.grabber import Grabber
+from tests.helpers import FakeBiliClient, GrabberTestCase, make_context, ok_prepare
 
 
 class GrabberPacingTests(GrabberTestCase):
@@ -13,9 +15,10 @@ class GrabberPacingTests(GrabberTestCase):
         config = self.make_config()
         config.interval_ms = 100
         config.rate_limit_backoff_ms = 2500
-        grabber = Grabber(config)
+        ctx = make_context(config)
+        executor = OrderExecutor(ctx, AsyncMock(return_value=False))
 
-        result = await grabber._handle_prepare_failure(
+        result = await executor.handle_prepare_failure(
             ticket.PrepareResult(code=429, message="请求过于频繁"),
             attempt=1,
             extra_params={},
@@ -23,7 +26,7 @@ class GrabberPacingTests(GrabberTestCase):
 
         self.assertIs(result.outcome, AttemptOutcome.RETRY)
         self.assertEqual(result.retry_delay, 2.5)
-        self.assertEqual(grabber.status.retry_reason, "请求过频/风控拦截")
+        self.assertEqual(ctx.status.retry_reason, "请求过频/风控拦截")
 
     async def test_rate_limit_create_records_retry_status(self) -> None:
         events: list[dict] = []
@@ -98,18 +101,15 @@ class GrabberPacingTests(GrabberTestCase):
         self.assertEqual(grabber.status.finished_reason, "达到最大尝试次数")
 
     def test_prepare_token_cache_is_scoped_to_sku(self) -> None:
-        grabber = Grabber(self.make_config())
-        grabber._cached_token = "token-301"
-        grabber._cached_ptoken = "ptoken"
-        grabber._cached_token_at = time.perf_counter()
-        grabber._cached_token_sku_id = 301
+        tokens = PrepareTokenCache()
+        tokens.store(301, "token-301", "ptoken")
 
         self.assertEqual(
-            grabber._reusable_token(TicketTarget(200, 301, "balcony", 6800)),
+            tokens.reusable(TicketTarget(200, 301, "balcony", 6800)),
             "token-301",
         )
         self.assertEqual(
-            grabber._reusable_token(TicketTarget(200, 302, "vip", 9800)),
+            tokens.reusable(TicketTarget(200, 302, "vip", 9800)),
             "",
         )
 
@@ -117,47 +117,48 @@ class GrabberPacingTests(GrabberTestCase):
         config = self.make_config()
         config.interval_ms = 500
         config.max_interval_ms = 3000
-        grabber = Grabber(config)
+        status = GrabberStatus()
+        pacing = PacingController(config, status)
 
-        self.assertAlmostEqual(grabber._dynamic_interval, 0.5)
-        grabber._on_rate_limit()
-        self.assertAlmostEqual(grabber._dynamic_interval, 1.0)
-        grabber._on_rate_limit()
-        self.assertAlmostEqual(grabber._dynamic_interval, 2.0)
-        self.assertEqual(grabber.status.rate_limit_count, 2)
-        self.assertEqual(grabber.status.consecutive_rate_limits, 2)
-        self.assertEqual(grabber._rate_limit_recovery_remaining, 10)
+        self.assertAlmostEqual(pacing.dynamic_interval, 0.5)
+        pacing.on_rate_limit()
+        self.assertAlmostEqual(pacing.dynamic_interval, 1.0)
+        pacing.on_rate_limit()
+        self.assertAlmostEqual(pacing.dynamic_interval, 2.0)
+        self.assertEqual(status.rate_limit_count, 2)
+        self.assertEqual(status.consecutive_rate_limits, 2)
+        self.assertEqual(pacing.rate_limit_recovery_remaining, 10)
 
-        grabber._on_retryable()
-        self.assertAlmostEqual(grabber._dynamic_interval, 2.0)
-        self.assertEqual(grabber.status.consecutive_rate_limits, 0)
-        self.assertEqual(grabber._rate_limit_recovery_remaining, 9)
+        pacing.on_retryable()
+        self.assertAlmostEqual(pacing.dynamic_interval, 2.0)
+        self.assertEqual(status.consecutive_rate_limits, 0)
+        self.assertEqual(pacing.rate_limit_recovery_remaining, 9)
 
         for _ in range(9):
-            grabber._on_retryable()
-        self.assertAlmostEqual(grabber._dynamic_interval, 2.0)
-        self.assertEqual(grabber._rate_limit_recovery_remaining, 0)
+            pacing.on_retryable()
+        self.assertAlmostEqual(pacing.dynamic_interval, 2.0)
+        self.assertEqual(pacing.rate_limit_recovery_remaining, 0)
 
-        grabber._on_retryable()
-        self.assertAlmostEqual(grabber._dynamic_interval, 1.975)
-
-        for _ in range(200):
-            grabber._on_retryable()
-        self.assertAlmostEqual(grabber._dynamic_interval, 0.5)
+        pacing.on_retryable()
+        self.assertAlmostEqual(pacing.dynamic_interval, 1.975)
 
         for _ in range(200):
-            grabber._on_rate_limit()
-        self.assertAlmostEqual(grabber._dynamic_interval, 3.0)
+            pacing.on_retryable()
+        self.assertAlmostEqual(pacing.dynamic_interval, 0.5)
+
+        for _ in range(200):
+            pacing.on_rate_limit()
+        self.assertAlmostEqual(pacing.dynamic_interval, 3.0)
 
     def test_aimd_disabled_keeps_fixed_interval(self) -> None:
         config = self.make_config()
         config.interval_ms = 500
         config.adaptive_rate_enabled = False
-        grabber = Grabber(config)
+        pacing = PacingController(config, GrabberStatus())
 
-        grabber._on_rate_limit()
-        self.assertAlmostEqual(grabber._dynamic_interval, 0.5)
-        self.assertAlmostEqual(grabber._retry_delay(), 0.5)
+        pacing.on_rate_limit()
+        self.assertAlmostEqual(pacing.dynamic_interval, 0.5)
+        self.assertAlmostEqual(pacing.retry_delay(), 0.5)
 
     async def test_prepare_token_reused_on_congestion(self) -> None:
         config = self.make_config()

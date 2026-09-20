@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock, patch
 
 from app.bili import ticket
+from app.grab_clock import GrabClock
 from app.grabber import Grabber
 from tests.helpers import FakeBiliClient, GrabberTestCase, ok_prepare
 
@@ -129,8 +130,8 @@ class GrabberPrepareTests(GrabberTestCase):
 
         with (
             patch("app.grabber.BiliClient", FakeBiliClient),
-            patch("app.grabber.Grabber._wait_until_prewarm", new=AsyncMock()) as wait_prewarm,
-            patch("app.grabber.Grabber._wait_until_start", new=AsyncMock()) as wait_start,
+            patch.object(GrabClock, "wait_until_prewarm", new=AsyncMock()) as wait_prewarm,
+            patch.object(GrabClock, "wait_until_start", new=AsyncMock()) as wait_start,
             patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)) as get_buyers,
             patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)) as get_project,
             patch(

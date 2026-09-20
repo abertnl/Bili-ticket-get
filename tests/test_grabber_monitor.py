@@ -6,9 +6,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from app import grab_targets
 from app.bili import ticket
+from app.grab_monitor import ReturnTicketMonitor
 from app.grabber import Grabber, TicketTarget
-from tests.helpers import FakeBiliClient, GrabberTestCase, ok_prepare
+from tests.helpers import FakeBiliClient, GrabberTestCase, make_context, ok_prepare
 
 
 class GrabberMonitorTests(GrabberTestCase):
@@ -39,7 +41,7 @@ class GrabberMonitorTests(GrabberTestCase):
                 patch("app.grabber.BiliClient", FakeBiliClient),
                 patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
                 patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
-                patch("app.grabber.Grabber._wait_for_return_ticket", new=wait_for_return),
+                patch.object(ReturnTicketMonitor, "wait_for_return_ticket", new=wait_for_return),
                 patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
                 patch("app.grabber.ticket.create_order", new=create_order),
                 patch("app.grabber.asyncio.sleep", new=AsyncMock()),
@@ -60,12 +62,15 @@ class GrabberMonitorTests(GrabberTestCase):
         self.assertEqual(burst_finishes[0]["burst_rate_limits"], 3)
 
     def test_return_monitor_stock_detection_uses_count_and_sale_flag(self) -> None:
-        grabber = Grabber(self.make_config())
+        config = self.make_config()
 
-        self.assertFalse(grabber._sku_looks_available(ticket.TicketSku(300, "vip", 8800, "售罄", 1)))
-        self.assertTrue(grabber._sku_looks_available(ticket.TicketSku(300, "vip", 8800, "立即购买", 0)))
-        self.assertFalse(grabber._sku_looks_available(ticket.TicketSku(300, "vip", 8800, "已售罄", 0)))
-        self.assertFalse(grabber._sku_looks_available(ticket.TicketSku(300, "vip", 8800, "暂未开售", 0)))
+        def available(sale_flag: str, num: int) -> bool:
+            return grab_targets.sku_looks_available(config, ticket.TicketSku(300, "vip", 8800, sale_flag, num))
+
+        self.assertFalse(available("售罄", 1))
+        self.assertTrue(available("立即购买", 0))
+        self.assertFalse(available("已售罄", 0))
+        self.assertFalse(available("暂未开售", 0))
 
     async def test_return_monitor_selects_highest_stock_candidate(self) -> None:
         config = self.make_config()
@@ -91,7 +96,7 @@ class GrabberMonitorTests(GrabberTestCase):
         )
 
         with patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)):
-            targets = await grabber._wait_for_return_ticket(
+            targets = await grabber._monitor.wait_for_return_ticket(
                 datetime.now().astimezone() + timedelta(minutes=5)
             )
 
@@ -102,7 +107,6 @@ class GrabberMonitorTests(GrabberTestCase):
     def test_return_monitor_ties_use_configured_order(self) -> None:
         config = self.make_config()
         config.return_monitor_sku_ids = [302, 301]
-        grabber = Grabber(config)
         project = ticket.Project(
             project_id=100,
             name="show",
@@ -119,7 +123,7 @@ class GrabberMonitorTests(GrabberTestCase):
             ],
         )
 
-        targets = grabber._available_monitor_targets(project)
+        targets = make_context(config).available_monitor_targets(project)
 
         self.assertEqual([target.sku_id for target in targets], [302, 301])
 
@@ -158,7 +162,7 @@ class GrabberMonitorTests(GrabberTestCase):
             patch("app.grabber.BiliClient", FakeBiliClient),
             patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
             patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
-            patch("app.grabber.Grabber._wait_for_return_ticket", new=AsyncMock(return_value=False)) as wait_for_return,
+            patch.object(ReturnTicketMonitor, "wait_for_return_ticket", new=AsyncMock(return_value=False)) as wait_for_return,
             patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())) as prepare_order,
             patch(
                 "app.grabber.ticket.create_order",
@@ -198,7 +202,7 @@ class GrabberMonitorTests(GrabberTestCase):
             patch("app.grabber.BiliClient", FakeBiliClient),
             patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
             patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
-            patch("app.grabber.Grabber._wait_for_return_ticket", new=wait_for_return),
+            patch.object(ReturnTicketMonitor, "wait_for_return_ticket", new=wait_for_return),
             patch(
                 "app.grabber.ticket.prepare_order",
                 new=AsyncMock(return_value=ok_prepare()),
@@ -255,7 +259,7 @@ class GrabberMonitorTests(GrabberTestCase):
             patch("app.grabber.BiliClient", FakeBiliClient),
             patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
             patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
-            patch("app.grabber.Grabber._wait_for_return_ticket", new=wait_for_return),
+            patch.object(ReturnTicketMonitor, "wait_for_return_ticket", new=wait_for_return),
             patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
             patch("app.grabber.ticket.create_order", new=create_order),
             patch("app.grabber.asyncio.sleep", new=AsyncMock()),
@@ -328,7 +332,7 @@ class GrabberMonitorTests(GrabberTestCase):
                 "app.grabber.ticket.get_project",
                 new=AsyncMock(side_effect=[initial_project, refreshed_project]),
             ),
-            patch("app.grabber.Grabber._wait_for_return_ticket", new=wait_for_return),
+            patch.object(ReturnTicketMonitor, "wait_for_return_ticket", new=wait_for_return),
             patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
             patch("app.grabber.ticket.create_order", new=create_order),
             patch("app.grabber.asyncio.sleep", new=AsyncMock()),
@@ -366,7 +370,7 @@ class GrabberMonitorTests(GrabberTestCase):
             patch("app.grabber.BiliClient", FakeBiliClient),
             patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
             patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
-            patch("app.grabber.Grabber._wait_for_return_ticket", new=wait_for_return),
+            patch.object(ReturnTicketMonitor, "wait_for_return_ticket", new=wait_for_return),
             patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
             patch("app.grabber.ticket.create_order", new=create_order),
             patch("app.grabber.asyncio.sleep", new=AsyncMock()),
@@ -405,7 +409,7 @@ class GrabberMonitorTests(GrabberTestCase):
             patch("app.grabber.BiliClient", FakeBiliClient),
             patch("app.grabber.ticket.get_buyers", new=AsyncMock(return_value=buyers)),
             patch("app.grabber.ticket.get_project", new=AsyncMock(return_value=project)),
-            patch("app.grabber.Grabber._wait_for_return_ticket", new=wait_for_return),
+            patch.object(ReturnTicketMonitor, "wait_for_return_ticket", new=wait_for_return),
             patch("app.grabber.ticket.prepare_order", new=AsyncMock(return_value=ok_prepare())),
             patch("app.grabber.ticket.create_order", new=create_order),
             patch("app.grabber.asyncio.sleep", new=AsyncMock()),

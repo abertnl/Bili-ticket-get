@@ -9,6 +9,40 @@ from pathlib import Path
 
 from app.bili import ticket
 from app.config import AppConfig
+from app.grab_clock import GrabClock
+from app.grab_context import GrabContext
+from app.grab_models import GrabberStatus
+from app.grab_pacing import PacingController, PrepareTokenCache
+from app.grab_reporting import RunRecorder
+
+
+def make_context(
+    config: AppConfig,
+    *,
+    status: GrabberStatus | None = None,
+    client=None,
+    emit=None,
+) -> GrabContext:
+    """装配一个不依赖 Grabber 的运行上下文，供监控与下单的单元测试使用。"""
+
+    status = GrabberStatus() if status is None else status
+    emit = emit or (lambda *args, **kwargs: None)
+
+    def set_phase(phase) -> None:
+        status.phase = phase
+
+    return GrabContext(
+        config=config,
+        status=status,
+        recorder=RunRecorder(),
+        pacing=PacingController(config, status),
+        tokens=PrepareTokenCache(),
+        clock=GrabClock(config, emit, set_phase),
+        emit=emit,
+        emit_status=lambda: None,
+        set_phase=set_phase,
+        client=client,
+    )
 
 
 def load_entrypoint_module():
