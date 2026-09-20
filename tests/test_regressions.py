@@ -16,6 +16,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app import notify
 from app import server
+from app.admin_auth import ADMIN_COOKIE_NAME, AUTH_FAILURE_LIMIT
 from app.bili.captcha import RrocrSolver
 from app.bili import auth, ticket
 from app.bili.client import BiliClient
@@ -67,7 +68,7 @@ class ServerConfigTests(unittest.TestCase):
             server=ServerConfig(admin_token=self.admin_token),
         )
         server.state.grabber = None
-        server._auth_failures.clear()
+        server.admin_auth.failures.clear()
         self.client = TestClient(server.app, headers={"X-Admin-Token": self.admin_token})
 
     def test_config_response_redacts_sensitive_values(self) -> None:
@@ -127,7 +128,7 @@ class ServerConfigTests(unittest.TestCase):
             server=ServerConfig(admin_token=self.admin_token),
         )
         plain_client = TestClient(server.app)
-        plain_client.cookies.set(server.ADMIN_COOKIE_NAME, "stale-token")
+        plain_client.cookies.set(ADMIN_COOKIE_NAME, "stale-token")
 
         response = plain_client.get("/")
         index_response = plain_client.get("/index.html")
@@ -208,7 +209,7 @@ class ServerConfigTests(unittest.TestCase):
         too_large = plain_client.post("/auth/token", content="token=" + ("x" * 2048))
         self.assertEqual(too_large.status_code, 413)
 
-        for _ in range(server.AUTH_FAILURE_LIMIT):
+        for _ in range(AUTH_FAILURE_LIMIT):
             response = plain_client.post("/auth/token", data={"token": "wrong"})
             self.assertEqual(response.status_code, 401)
 
@@ -1378,7 +1379,9 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
-        wait_for_return = AsyncMock(side_effect=[True, False])
+        wait_for_return = AsyncMock(
+            side_effect=[[TicketTarget(200, 300, "vip", 8800, "销售中", 1, 0)], False]
+        )
 
         with (
             patch("app.grabber.BiliClient", FakeBiliClient),
@@ -1628,7 +1631,9 @@ class GrabberTests(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
-        wait_for_return = AsyncMock(side_effect=[True, False])
+        wait_for_return = AsyncMock(
+            side_effect=[[TicketTarget(200, 300, "vip", 8800, "销售中", 1, 0)], False]
+        )
         create_order = AsyncMock(return_value=ticket.CreateResult(code=100009, message="库存不足"))
 
         with (
