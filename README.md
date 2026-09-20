@@ -86,7 +86,13 @@ uv run main.py
 │   ├── admin_auth.py       # 管理 token、来源校验与认证失败限流
 │   ├── api_schemas.py      # API 请求模型与可更新字段白名单
 │   ├── config_service.py   # 配置脱敏、敏感字段合并与启动校验
-│   ├── grabber.py          # 抢票生命周期、预热与下单循环
+│   ├── grabber.py          # 抢票生命周期编排：预热、等待开抢、冲刺与监控轮转
+│   ├── grab_context.py     # 单次运行的协作对象与共享状态写入
+│   ├── grab_order.py       # 单次预下单 + 下单，结果分类与抢中后的支付推送
+│   ├── grab_monitor.py     # 回流票低频轮询
+│   ├── grab_pacing.py      # AIMD 自适应间隔、限流冷却与 prepare token 复用
+│   ├── grab_clock.py       # 服务端时间偏移、预热等待与开抢倒计时
+│   ├── grab_targets.py     # 票档解析与库存判断（纯函数）
 │   ├── grab_models.py      # 抢票状态、票档及策略结果模型
 │   ├── grab_strategy.py    # 首发及回流冲刺的阶段决策
 │   ├── grab_reporting.py   # JSONL 运行记录与统一报告生成
@@ -101,16 +107,22 @@ uv run main.py
 │       └── errors.py       # 错误码分类
 ├── web/                    # 前端静态文件
 │   ├── index.html
-│   ├── app.js
-│   └── style.css
+│   ├── style.css
+│   └── js/                 # ES modules，无需构建
+│       ├── main.js         # 入口：先拉配置再连 WebSocket
+│       ├── api.js          # fetch 封装与未授权跳转
+│       ├── dom.js  log.js  tabs.js
+│       ├── login.js  project.js  config.js  datetime.js
+│       └── monitor.js  captcha.js  ws.js
 ├── config.example.json     # 配置示例
 ├── pyproject.toml          # 项目元数据与依赖
 └── docs/
     └── 使用说明.md         # 详细使用文档
 ```
 
-`Grabber` 负责初始化每次运行、预热准备和执行下单循环，统一处理取消及客户端关闭。
-策略和报告组件不依赖 Web 服务；鉴权组件在每次请求时读取当前配置。
+`Grabber` 只负责编排：重建每次运行的协作对象、预热、等待开抢，再驱动冲刺与回流监控的轮转。
+限速、计时、票档解析、下单执行和监控各自独立成模块，可以脱离 Web 服务和 HTTP 客户端单独测试；
+策略与报告组件同样不依赖 Web 服务，鉴权组件在每次请求时读取当前配置。
 `app.grabber` 保留原有数据类型的导入入口，接口、配置格式及抢票策略保持兼容。
 
 ## 技术栈
