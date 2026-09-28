@@ -75,3 +75,9 @@ When modifying the grabber or server, prefer adding regression tests that patch 
 - `config.json` is written with `0o600` permissions and excluded from the hatch wheel build.
 - `rrocr_token`, cookie, and notify URLs/keys are redacted from public config responses and from error logs in `notify.py`.
 - The admin token is required for all `/api/*` routes and `/ws`; configure a strong token in production rather than relying on the generated temporary one.
+
+## Cursor Cloud specific instructions
+
+- System `python3` on the Cloud Agent base image is 3.12. This repo pins Python 3.13 in `.python-version`. `uv` is on `PATH` at `/usr/local/bin/uv` and installs CPython 3.13. Run the app and tests with `uv run`, not system `python3`.
+- Match CI with `uv sync --locked`, then `uv run --with flake8 flake8 .` and `uv run pytest`. Tests mock Bilibili and do not need cookies, captcha tokens, or notify keys.
+- The dev server listens on `http://127.0.0.1:8000`. Set `TICKET_BUY_ADMIN_TOKEN` (at least 16 characters) when a stable admin token is needed; otherwise startup prints a temporary token. `TICKET_BUY_CONFIG` overrides the gitignored `config.json` path.
