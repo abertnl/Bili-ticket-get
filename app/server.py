@@ -4,31 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
-import time
 from concurrent.futures import Future
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
-from urllib.parse import parse_qs, urlparse
+from typing import Any
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import ValidationError
 
 from .bili import auth, ticket
 from .bili.client import BiliClient
-from .config import AppConfig, NotifyConfig, effective_admin_token, ensure_admin_token, load_config, save_config
+from .admin_auth import (
+    ADMIN_COOKIE_NAME,
+    AUTH_BODY_MAX_BYTES,
+    AdminAuth,
+    auth_client_key,
+    set_admin_cookie,
+)
+from .api_schemas import CaptchaSubmit, ConfigUpdate, CookieLogin
+from .config import AppConfig, ensure_admin_token, load_config, save_config
+from .config_service import merge_sensitive_updates, public_config, validate_grab_config
+from .grab_reporting import build_report
 from .grabber import Grabber
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-ADMIN_COOKIE_NAME = "ticket_buy_admin"
-SENSITIVE_PLACEHOLDER = "***"
-AUTH_BODY_MAX_BYTES = 1024
-AUTH_FAILURE_LIMIT = 5
-AUTH_FAILURE_WINDOW_SECONDS = 60.0
-_auth_failures: dict[str, list[float]] = {}
 
 
 class AppState:
@@ -66,205 +67,11 @@ class AppState:
 
 
 state = AppState()
-
-
-# ---- 请求体模型 ----
-class CookieLogin(BaseModel):
-    cookie: str = Field(max_length=16384)
-
-
-class CaptchaSubmit(BaseModel):
-    validate_value: str = Field(alias="validate", max_length=2048)
-    seccode: str = Field(max_length=2048)
-
-
-class NotifyUpdate(BaseModel):
-    bark_url: str = Field(default="", max_length=2048)
-    serverchan_key: str = Field(default="", max_length=128)
-    imessage_recipient: str = Field(default="", max_length=256)
-
-    @field_validator("bark_url")
-    @classmethod
-    def validate_bark_url(cls, value: str) -> str:
-        if value == SENSITIVE_PLACEHOLDER:
-            return value
-        return NotifyConfig.validate_bark_url(value)
-
-    @field_validator("serverchan_key")
-    @classmethod
-    def validate_serverchan_key(cls, value: str) -> str:
-        if value == SENSITIVE_PLACEHOLDER:
-            return value
-        return NotifyConfig.validate_serverchan_key(value)
-
-
-class ConfigUpdate(BaseModel):
-    """允许通过配置接口修改的字段白名单。"""
-
-    project_id: int | None = Field(default=None, ge=0)
-    screen_id: int | None = Field(default=None, ge=0)
-    sku_id: int | None = Field(default=None, ge=0)
-    buyer_ids: list[int] | None = None
-    contact_name: str | None = Field(default=None, max_length=64)
-    contact_tel: str | None = Field(default=None, max_length=32)
-    count: int | None = Field(default=None, ge=1)
-    start_time: str | None = Field(default=None, max_length=64)
-    interval_ms: int | None = Field(default=None, ge=100)
-    max_attempts: int | None = Field(default=None, ge=1)
-    prewarm_seconds: int | None = Field(default=None, ge=0)
-    rate_limit_backoff_ms: int | None = Field(default=None, ge=1000)
-    rate_limit_cooldown_ms: int | None = Field(default=None, ge=1000)
-    network_backoff_max_ms: int | None = Field(default=None, ge=100)
-    adaptive_rate_enabled: bool | None = None
-    max_interval_ms: int | None = Field(default=None, ge=100)
-    time_sync_enabled: bool | None = None
-    connection_prewarm_enabled: bool | None = None
-    http2_enabled: bool | None = None
-    payment_link_enabled: bool | None = None
-    sold_out_burst_attempts: int | None = Field(default=None, ge=1)
-    return_monitor_enabled: bool | None = None
-    return_monitor_sku_ids: list[int] | None = None
-    monitor_interval_ms: int | None = Field(default=None, ge=1000)
-    monitor_end_time: str | None = Field(default=None, max_length=64)
-    captcha_mode: Literal["manual", "rrocr"] | None = None
-    rrocr_token: str | None = Field(default=None, max_length=512)
-    notify: NotifyUpdate | None = None
-
-    @field_validator("buyer_ids")
-    @classmethod
-    def validate_buyer_ids(cls, value: list[int] | None) -> list[int] | None:
-        if value is not None and any(buyer_id <= 0 for buyer_id in value):
-            raise ValueError("buyer_ids 必须是正整数")
-        return value
-
-    @field_validator("return_monitor_sku_ids")
-    @classmethod
-    def validate_return_monitor_sku_ids(cls, value: list[int] | None) -> list[int] | None:
-        if value is not None and any(sku_id <= 0 for sku_id in value):
-            raise ValueError("return_monitor_sku_ids 必须是正整数")
-        return value
-
-
-def _public_config(config: AppConfig) -> dict[str, Any]:
-    """返回给浏览器的配置，避免回显账号凭据和推送密钥。"""
-
-    data = config.model_dump(exclude={"cookie", "rrocr_token"})
-    data["server"].pop("admin_token", None)
-    data["has_cookie"] = bool(config.cookie)
-    data["has_rrocr_token"] = bool(config.rrocr_token)
-    data["admin_token_required"] = _admin_token_required()
-    data["notify"] = {
-        "bark_url": SENSITIVE_PLACEHOLDER if config.notify.bark_url else "",
-        "serverchan_key": SENSITIVE_PLACEHOLDER if config.notify.serverchan_key else "",
-        "imessage_recipient": SENSITIVE_PLACEHOLDER if config.notify.imessage_recipient else "",
-    }
-    data["notify_configured"] = {
-        "bark_url": bool(config.notify.bark_url),
-        "serverchan_key": bool(config.notify.serverchan_key),
-        "imessage_recipient": bool(config.notify.imessage_recipient),
-    }
-    return data
+admin_auth = AdminAuth(lambda: state.config)
 
 
 def _error(message: str, status_code: int = 400) -> JSONResponse:
     return JSONResponse({"ok": False, "message": message}, status_code=status_code)
-
-
-def _admin_token_required() -> bool:
-    return True
-
-
-def _admin_token() -> str:
-    return effective_admin_token(state.config)
-
-
-def _token_matches(value: str | None) -> bool:
-    token = _admin_token()
-    if not token or value is None:
-        return False
-    return hmac.compare_digest(value, token)
-
-
-def _bearer_token(header: str | None) -> str | None:
-    if not header:
-        return None
-    scheme, _, value = header.partition(" ")
-    if scheme.lower() == "bearer" and value:
-        return value
-    return None
-
-
-def _request_authorized(request: Request) -> bool:
-    if not _admin_token_required():
-        return True
-    return (
-        _token_matches(request.cookies.get(ADMIN_COOKIE_NAME))
-        or _token_matches(request.headers.get("x-admin-token"))
-        or _token_matches(_bearer_token(request.headers.get("authorization")))
-    )
-
-
-def _websocket_authorized(websocket: WebSocket) -> bool:
-    if not _admin_token_required():
-        return True
-    return (
-        _origin_allowed(websocket.headers.get("origin"), websocket.headers.get("host"))
-        and (
-            _token_matches(websocket.cookies.get(ADMIN_COOKIE_NAME))
-            or _token_matches(websocket.headers.get("x-admin-token"))
-            or _token_matches(_bearer_token(websocket.headers.get("authorization")))
-        )
-    )
-
-
-def _origin_allowed(origin: str | None, host_header: str | None) -> bool:
-    if not origin:
-        return True
-    if not host_header:
-        return False
-    parsed = urlparse(origin)
-    if parsed.scheme not in {"http", "https"}:
-        return False
-    normalized = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
-    if normalized in state.config.server.allowed_origins:
-        return True
-    return parsed.netloc.lower() == host_header.split(",", 1)[0].strip().lower()
-
-
-def _auth_client_key(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
-
-
-def _auth_failures_for(client_key: str) -> list[float]:
-    now = time.monotonic()
-    failures = [ts for ts in _auth_failures.get(client_key, []) if now - ts <= AUTH_FAILURE_WINDOW_SECONDS]
-    _auth_failures[client_key] = failures
-    return failures
-
-
-def _auth_rate_limited(client_key: str) -> bool:
-    return len(_auth_failures_for(client_key)) >= AUTH_FAILURE_LIMIT
-
-
-def _record_auth_failure(client_key: str) -> None:
-    failures = _auth_failures_for(client_key)
-    failures.append(time.monotonic())
-    _auth_failures[client_key] = failures
-
-
-def _clear_auth_failures(client_key: str) -> None:
-    _auth_failures.pop(client_key, None)
-
-
-def _set_admin_cookie(response: Response, request: Request, token: str) -> None:
-    response.set_cookie(
-        ADMIN_COOKIE_NAME,
-        token,
-        httponly=True,
-        secure=request.url.scheme == "https",
-        samesite="strict",
-        max_age=60 * 60 * 12,
-    )
 
 
 def _login_page() -> Response:
@@ -293,64 +100,6 @@ def _login_page_with_cleared_cookie() -> Response:
     return response
 
 
-def _merge_sensitive_updates(updates: dict[str, Any]) -> dict[str, Any]:
-    """敏感字段占位符表示保留旧值，空字符串表示清空。"""
-
-    if updates.get("rrocr_token") == "":
-        updates.pop("rrocr_token")
-    notify = updates.get("notify")
-    if isinstance(notify, dict):
-        current = state.config.notify.model_dump()
-        merged_notify = current.copy()
-        for key, value in notify.items():
-            if value == SENSITIVE_PLACEHOLDER:
-                merged_notify[key] = current.get(key, "")
-            else:
-                merged_notify[key] = value
-        updates["notify"] = merged_notify
-    return updates
-
-
-def _parse_local_datetime(value: str, label: str) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as exc:
-        raise ValueError(f"{label}格式无效") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
-    return parsed
-
-
-def _validate_grab_config(config: AppConfig) -> str | None:
-    """Return a user-facing error message when the task cannot start locally."""
-
-    if not config.cookie:
-        return "请先登录"
-    if config.project_id <= 0:
-        return "请先选择演出"
-    if config.screen_id <= 0:
-        return "请先选择场次"
-    if config.sku_id <= 0:
-        return "请先选择票档"
-    if not config.buyer_ids:
-        return "请先选择购票人"
-
-    try:
-        _parse_local_datetime(config.start_time, "开抢时间")
-        monitor_end = _parse_local_datetime(config.monitor_end_time, "监控截止时间")
-    except ValueError as exc:
-        return str(exc)
-
-    if config.return_monitor_enabled:
-        if monitor_end is None:
-            return "启用回流票监控时必须设置监控截止时间"
-        if datetime.now(tz=monitor_end.tzinfo) >= monitor_end:
-            return "监控截止时间已过期"
-    return None
-
-
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     state.loop = asyncio.get_running_loop()
@@ -367,11 +116,11 @@ async def require_admin_token(request: Request, call_next):
     if request.url.path == "/auth/token":
         return await call_next(request)
     if request.url.path.startswith("/api/"):
-        if not _origin_allowed(request.headers.get("origin"), request.headers.get("host")):
+        if not admin_auth.origin_allowed(request.headers.get("origin"), request.headers.get("host")):
             return _error("未授权：来源不被允许", 403)
-        if not _request_authorized(request):
+        if not admin_auth.request_authorized(request):
             return _error("未授权：请提供管理 token", 401)
-    elif not _request_authorized(request):
+    elif not admin_auth.request_authorized(request):
         return _login_page_with_cleared_cookie()
     response = await call_next(request)
     if not request.url.path.startswith("/api/"):
@@ -382,17 +131,17 @@ async def require_admin_token(request: Request, call_next):
 # ---- 页面 ----
 @app.get("/")
 async def index(request: Request) -> Response:
-    if not _request_authorized(request):
+    if not admin_auth.request_authorized(request):
         return _login_page_with_cleared_cookie()
     return FileResponse(WEB_DIR / "index.html")
 
 
 @app.post("/auth/token")
 async def auth_token(request: Request) -> Response:
-    if not _origin_allowed(request.headers.get("origin"), request.headers.get("host")):
+    if not admin_auth.origin_allowed(request.headers.get("origin"), request.headers.get("host")):
         return _error("未授权：来源不被允许", 403)
-    client_key = _auth_client_key(request)
-    if _auth_rate_limited(client_key):
+    client_key = auth_client_key(request)
+    if admin_auth.rate_limited(client_key):
         return _error("认证失败次数过多，请稍后再试", 429)
     content_length = request.headers.get("content-length")
     if content_length:
@@ -406,12 +155,12 @@ async def auth_token(request: Request) -> Response:
     if len(body.encode("utf-8")) > AUTH_BODY_MAX_BYTES:
         return _error("请求体过大", 413)
     token = parse_qs(body).get("token", [""])[0]
-    if not _token_matches(token):
-        _record_auth_failure(client_key)
+    if not admin_auth.token_matches(token):
+        admin_auth.record_failure(client_key)
         return _error("管理 token 无效", 401)
-    _clear_auth_failures(client_key)
+    admin_auth.clear_failures(client_key)
     response = RedirectResponse("/", status_code=303)
-    _set_admin_cookie(response, request, token)
+    set_admin_cookie(response, request, token)
     return response
 
 
@@ -471,13 +220,13 @@ async def login_status() -> dict[str, Any]:
 # ---- 配置 ----
 @app.get("/api/config")
 async def get_config() -> dict[str, Any]:
-    return _public_config(state.config)
+    return public_config(state.config)
 
 
 @app.post("/api/config")
 async def update_config(body: ConfigUpdate) -> Any:
     # 只更新客户端显式传入的字段（排除 None），其余保留原值
-    updates = _merge_sensitive_updates(body.model_dump(exclude_unset=True, exclude_none=True))
+    updates = merge_sensitive_updates(state.config, body.model_dump(exclude_unset=True, exclude_none=True))
     merged = state.config.model_dump()
     merged.update(updates)
     try:
@@ -485,7 +234,7 @@ async def update_config(body: ConfigUpdate) -> Any:
     except ValidationError as exc:
         return _error(f"配置无效: {exc.errors()[0]['msg']}", 400)
     save_config(state.config)
-    return {"ok": True, "config": _public_config(state.config)}
+    return {"ok": True, "config": public_config(state.config)}
 
 
 # ---- 演出 / 购票人 ----
@@ -553,7 +302,7 @@ async def get_buyers() -> JSONResponse:
 async def grab_start() -> Any:
     if state.grabber and state.grabber.is_running():
         return {"ok": False, "message": "已经在抢票中"}
-    error = _validate_grab_config(state.config)
+    error = validate_grab_config(state.config)
     if error:
         return _error(error, 400)
     grabber = state.new_grabber()
@@ -578,32 +327,7 @@ async def grab_status() -> dict[str, Any]:
 @app.get("/api/grab/report")
 async def grab_report() -> dict[str, Any]:
     if not state.grabber:
-        return {
-            "run_id": "",
-            "phase": "idle",
-            "running": False,
-            "success": False,
-            "finished_reason": "",
-            "attempts": 0,
-            "monitor_checks": 0,
-            "effective_order_attempts": 0,
-            "rate_limit_count": 0,
-            "congestion_count": 0,
-            "sold_out_count": 0,
-            "network_errors": 0,
-            "telemetry_path": "",
-            "order_id": "",
-            "payment_url": "",
-            "pay_qrcode_url": "",
-            "time_offset_ms": 0,
-            "prewarm_ok": False,
-            "transport": "",
-            "target_sku_id": 0,
-            "target_sku_desc": "",
-            "monitor_target_count": 0,
-            "last_monitor_candidates": "",
-            "elapsed_ms": 0,
-        }
+        return build_report()
     return state.grabber.report()
 
 
@@ -627,7 +351,7 @@ async def captcha_submit(body: CaptchaSubmit) -> dict[str, Any]:
 # ---- WebSocket 实时日志 ----
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket) -> None:
-    if not _websocket_authorized(websocket):
+    if not admin_auth.websocket_authorized(websocket):
         await websocket.close(code=1008)
         return
     await websocket.accept()
